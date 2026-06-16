@@ -116,18 +116,26 @@ class GuessNumberCog(commands.Cog):
         view = View(timeout=60)
 
         async def easy_callback(interaction):
+            if interaction.user != message_author:
+                return await interaction.response.send_message("This is not your game.", ephemeral=True)
             await interaction.response.send_message(f"Started on `Easy` difficulty! Good Luck! {CHECK}")
             await self.game_start("easy")
 
         async def normal_callback(interaction):
+            if interaction.user != message_author:
+                return await interaction.response.send_message("This is not your game.", ephemeral=True)
             await interaction.response.send_message(f"Started on `Normal` difficulty! Good Luck! {CHECK}")
             await self.game_start("normal")
 
         async def hard_callback(interaction):
+            if interaction.user != message_author:
+                return await interaction.response.send_message("This is not your game.", ephemeral=True)
             await interaction.response.send_message(f"Started on `Hard` difficulty! Good Luck, you will need it! {CHECK}")
             await self.game_start("hard")
 
         async def custom_callback(interaction: discord.Interaction):
+            if interaction.user != message_author:
+                return await interaction.response.send_message("This is not your game.", ephemeral=True)
             self.awaiting_custom_input = True
             await interaction.response.send_message("Please enter your custom max number:", ephemeral=True)
             
@@ -197,7 +205,8 @@ class GuessNumberCog(commands.Cog):
 
                 view = await self.create_difficulty_view(message.author)
                 
-                await channel.last_message.delete()
+                if channel.last_message:
+                    await channel.last_message.delete()
                 await channel.send(f"{message.author.mention} Please select a difficulty:", view=view)
                 
             elif content == "difficulty":

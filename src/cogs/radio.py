@@ -6,13 +6,7 @@ import aiohttp
 import re
 from typing import Optional
 from util.constants import *
-from util.music.queue import *
-from modals.embeds import *
-from lang.texts import *
-from typing import TYPE_CHECKING
 
-if TYPE_CHECKING:
-    from cogs.music import play_next
 
 class RadioCog(commands.Cog):
     def __init__(self, bot):

@@ -12,6 +12,7 @@ from util.music.queue import *
 from modals.embeds import *
 from lang.texts import *
 from views.musicviews import ActionsView
+from util.resolver import resolve_to_search_query, needs_resolution, is_playlist
 import json
 import os
 from datetime import datetime, timedelta
@@ -19,6 +20,57 @@ from ytmusicapi import YTMusic
 import re
 
 guild_queues = {}
+guild_volumes = {}
+
+AUTOPLAY_URL_RE = re.compile(r"(https?://[^\s)]+)", re.IGNORECASE)
+
+MUSIC_SOURCES = {
+    "spotify":   {"domain": "open.spotify.com",     "label": "Spotify",     "icon": "🎧", "extractor": "spotify"},
+    "deezer":    {"domain": "deezer.com",           "label": "Deezer",     "icon": "🎵", "extractor": "deezer"},
+    "tidal":     {"domain": "tidal.com",            "label": "Tidal",      "icon": "🌊", "extractor": "tidal"},
+    "soundcloud":{"domain": "soundcloud.com",       "label": "SoundCloud", "icon": "☁️", "extractor": "soundcloud"},
+    "youtube":   {"domain": "youtube.com",          "label": "YouTube",    "icon": "▶️", "extractor": "youtube"},
+    "youtubemusic":{"domain": "music.youtube.com",  "label": "YouTube Music", "icon": "🎵", "extractor": "youtube"},
+    "youtu":     {"domain": "youtu.be",             "label": "YouTube",    "icon": "▶️", "extractor": "youtube"},
+    "applemusic":{"domain": "music.apple.com",      "label": "Apple Music","icon": "🍎", "extractor": "apple"},
+    "bandcamp":  {"domain": "bandcamp.com",         "label": "Bandcamp",   "icon": "🏕️", "extractor": "bandcamp"},
+    "twitch":    {"domain": "twitch.tv",            "label": "Twitch",     "icon": "📺", "extractor": "twitch"},
+    "vimeo":     {"domain": "vimeo.com",            "label": "Vimeo",      "icon": "🎬", "extractor": "vimeo"},
+}
+
+SEARCH_PREFIXES = {
+    "youtube":    "ytsearch",
+    "soundcloud": "scsearch",
+    "youtubemusic": "ytmsearch",
+    "youtu":      "ytsearch",
+}
+
+SOURCE_CHOICES = [
+    app_commands.Choice(name="Auto (default)", value="auto"),
+    app_commands.Choice(name="YouTube", value="youtube"),
+    app_commands.Choice(name="SoundCloud", value="soundcloud"),
+    app_commands.Choice(name="Spotify (URL only)", value="spotify"),
+    app_commands.Choice(name="Deezer (URL only)", value="deezer"),
+    app_commands.Choice(name="Tidal (URL only)", value="tidal"),
+    app_commands.Choice(name="Apple Music (URL only)", value="applemusic"),
+]
+
+def detect_source(url: str) -> dict:
+    for key, source in MUSIC_SOURCES.items():
+        domain = source["domain"]
+        if domain in url.lower():
+            return source
+    return {"label": "Unknown", "icon": "🔗", "extractor": None}
+
+def detect_source_from_entry(entry: dict) -> dict:
+    extractor = entry.get("extractor", "") or ""
+    for key, source in MUSIC_SOURCES.items():
+        if source["extractor"] and source["extractor"] in extractor.lower():
+            return source
+    webpage_url = entry.get("webpage_url", "")
+    if webpage_url:
+        return detect_source(webpage_url)
+    return {"label": "Unknown", "icon": "🔗", "extractor": None}
 
 def safe_avatar(user: discord.abc.User) -> Optional[str]:
     try:
@@ -49,7 +101,7 @@ class AsyncSongLoader:
                 'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
                 'options': '-vn -bufsize 512k'
             }
-            return discord.FFmpegOpusAudio(stream_url, **ffmpeg_args)
+            return discord.FFmpegPCMAudio(stream_url, **ffmpeg_args)
 
         return await loop.run_in_executor(self.executor, create_source)
 
@@ -57,7 +109,7 @@ song_loader = AsyncSongLoader()
 
 class OptimizedQueue:
     def __init__(self):
-        self.queue: List[Tuple[discord.AudioSource, tuple]] = []
+        self.queue: List[dict] = []
         self.playing = False
         self.lock = asyncio.Lock()
 
@@ -126,7 +178,7 @@ class MusicCog(commands.Cog):
                 footer_icon=safe_avatar(self.bot.user),
                 fields=[
                     ("Commands",
-                     "```\n/play <url|search>\n/queue\n/skip\n/pause\n/shuffle\n/stop\n/chart\n/clearqueue\n```",
+                     "```\n/play <url|search>\n/queue\n/skip\n/pause\n/shuffle\n/stop\n/volume\n/move\n/chart\n/clearqueue\n```",
                      False),
                     ("Status",
                      f"```\nServers: {len(self.bot.guilds)}\nUsers: {len(self.bot.users)}\n```",
@@ -144,7 +196,6 @@ class MusicCog(commands.Cog):
                         "Music Controls" in message.embeds[0].title
                     ):
                         await message.delete()
-                        break
 
                 await channel.send(embed=actions_embed, view=ActionsView(bot=self.bot))
         except Exception as e:
@@ -155,7 +206,19 @@ class MusicCog(commands.Cog):
             return
 
         queue = guild_queues[guild.id]
-        next_song_data = queue.get_next()
+
+        async with queue.lock:
+            if voice_client.is_playing():
+                return
+
+            next_song_data = queue.get_next()
+
+        def after_song(e):
+            if e:
+                print(f"Playback error: {e}")
+            queue.playing = False
+            pn = self.play_next(guild, voice_client, interaction)
+            asyncio.run_coroutine_threadsafe(pn, self.bot.loop)
 
         if next_song_data:
             try:
@@ -171,25 +234,33 @@ class MusicCog(commands.Cog):
                 
                 stream_url = fresh_info["url"]
                 
-                source = await song_loader.preload_audio_source(stream_url)
+                audio_source = await song_loader.preload_audio_source(stream_url)
                 
             except Exception as e:
-                print(f"Error creating audio source: {e}")
+                err = str(e)[:500]
+                print(f"Error extracting stream: {err}")
                 queue.playing = False
+                try:
+                    await interaction.followup.send(
+                        embed=self.make_embed(
+                            title="Playback error",
+                            description=f"Could not extract audio.\n```{err}```",
+                            color=0xe74c3c
+                        ),
+                        ephemeral=True
+                    )
+                except Exception:
+                    pass
                 await self.play_next(guild, voice_client, interaction)
                 return
 
             queue.playing = True
 
-            def after_song(e):
-                if e:
-                    print(f"Playback error: {e}")
-                queue.playing = False
-                pn = self.play_next(guild, voice_client, interaction)
-                asyncio.run_coroutine_threadsafe(pn, self.bot.loop)
+            volume = guild_volumes.get(guild.id, 1.0)
+            audio_source = discord.PCMVolumeTransformer(audio_source, volume=volume)
 
             try:
-                voice_client.play(source, after=after_song)
+                voice_client.play(audio_source, after=after_song)
             except Exception as e:
                 print(f"Error starting playback: {e}")
                 queue.playing = False
@@ -204,7 +275,10 @@ class MusicCog(commands.Cog):
                 next_song_data['song_url'],
                 next_song_data['likes'],
                 next_song_data['views'],
-                next_song_data['upload_date']
+                next_song_data['upload_date'],
+                next_song_data.get('source', {"label": "Unknown", "icon": "🔗", "extractor": None}),
+                next_song_data.get('requested_by_name'),
+                next_song_data.get('requested_by_id'),
             )
             
             embed = self.create_now_playing_embed(metadata, interaction)
@@ -237,114 +311,131 @@ class MusicCog(commands.Cog):
                                 candidates.append(f.name)
                                 candidates.append(f.value)
 
-                        url_re = re.compile(r"(https?://(?:music\.youtube\.com|(?:www\.)?youtube\.com|youtu\.be)[^\s]+)", re.IGNORECASE)
                         for text in candidates:
                             if not text:
                                 continue
-                            m = url_re.search(text)
+                            m = AUTOPLAY_URL_RE.search(text)
                             if m:
-                                song_link = m.group(1)
-                                break
+                                candidate_url = m.group(1).rstrip(")")
+                                source_info = detect_source(candidate_url)
+                                if source_info["extractor"]:
+                                    song_link = candidate_url
+                                    break
                         if song_link:
                             break
                     if song_link:
                         break
             except Exception as e:
                 print(f"Error scanning history for embed song link: {e}")
-            
-            try: 
-                fresh_info = await song_loader.extract_info_async(song_link)
-                if not fresh_info or "url" not in fresh_info:
-                    print(f"Failed to get fresh stream URL for autoplay {song_link}")
-                    queue.playing = False
-                    return
 
-                stream_url = fresh_info["url"]
-                source = await song_loader.preload_audio_source(stream_url)
-            except Exception as e:
-                print(f"Error creating audio source for autoplay: {e}")
+            if not song_link:
+                print("No song link found for autoplay")
                 queue.playing = False
                 return
-            
+
+            source_type = detect_source(song_link)
+            is_youtube = source_type["extractor"] == "youtube"
+
+            if not is_youtube:
+                print(f"Autoplay: non-YouTube source ({source_type['label']}) — autoplay only supported for YouTube")
+                queue.playing = False
+                return
+
             try:
-                print("suggestions")
                 yt = YTMusic()
                 video_id_match = re.search(r"(?:v=|youtu\.be/)([\w-]{11})", song_link)
                 if not video_id_match:
                     print(f"Could not extract video ID from link: {song_link}")
+                    queue.playing = False
                     return
 
                 video_id = video_id_match.group(1)
                 related_songs = yt.get_song_related(video_id)
 
-                suggestion = related_songs[0]["videoid"]
+                if not related_songs:
+                    print("No related songs found")
+                    queue.playing = False
+                    return
 
-                try:
-                    webpage_url = f"https://www.youtube.com/watch?v={suggestion}"
-                    
-                    fresh_info = await song_loader.extract_info_async(webpage_url)
-                    
-                    if not fresh_info or "url" not in fresh_info:
-                        print(f"Failed to get fresh stream URL for {webpage_url}")
-                        queue.playing = False
-                        await self.play_next(guild, voice_client, interaction)
-                        return
-                    
-                    stream_url = fresh_info["url"]
-                    
-                    source = await song_loader.preload_audio_source(stream_url)
-                    
-                except Exception as e:
-                    print(f"Error creating audio source: {e}")
+                suggestion = related_songs[0]["videoid"]
+                webpage_url = f"https://www.youtube.com/watch?v={suggestion}"
+            except Exception as e:
+                print(f"Autoplay suggestion error: {e}")
+                queue.playing = False
+                return
+
+            try:
+                fresh_info = await song_loader.extract_info_async(webpage_url)
+
+                if not fresh_info or "url" not in fresh_info:
+                    print(f"Failed to get fresh stream URL for {webpage_url}")
                     queue.playing = False
                     await self.play_next(guild, voice_client, interaction)
                     return
-                
-                queue.playing = True
 
-                def after_song(e):
-                    if e:
-                        print(f"Playback error: {e}")
-                    queue.playing = False
-                    pn = self.play_next(guild, voice_client, interaction)
-                    asyncio.run_coroutine_threadsafe(pn, self.bot.loop)
+                stream_url = fresh_info["url"]
+                audio_source = await song_loader.preload_audio_source(stream_url)
 
+            except Exception as e:
+                err = str(e)[:500]
+                print(f"Autoplay extract error: {err}")
+                queue.playing = False
                 try:
-                    voice_client.play(source, after=after_song)
-                except Exception as e:
-                    print(f"Error starting playback: {e}")
-                    queue.playing = False
-                    return
+                    await interaction.followup.send(
+                        embed=self.make_embed(
+                            title="Autoplay error",
+                            description=f"Could not extract audio.\n```{err}```",
+                            color=0xe74c3c
+                        ),
+                        ephemeral=True
+                    )
+                except Exception:
+                    pass
+                await self.play_next(guild, voice_client, interaction)
+                return
 
-                metadata = (
-                    next_song_data['title'],
-                    next_song_data['thumbnail'],
+            queue.playing = True
+
+            volume = guild_volumes.get(guild.id, 1.0)
+            audio_source = discord.PCMVolumeTransformer(audio_source, volume=volume)
+
+            try:
+                voice_client.play(audio_source, after=after_song)
+            except Exception as e:
+                print(f"Error starting autoplay playback: {e}")
+                queue.playing = False
+                return
+
+            processed = await self.process_single_entry(fresh_info, requester=interaction.user)
+            if processed:
+                embed = self.create_now_playing_embed((
+                    processed['title'],
+                    processed['thumbnail'],
                     None,
-                    next_song_data['duration'],
-                    next_song_data['author'],
-                    next_song_data['song_url'],
-                    next_song_data['likes'],
-                    next_song_data['views'],
-                    next_song_data['upload_date']
-                )
-                
-                embed = self.create_now_playing_embed(metadata, interaction)
+                    processed['duration'],
+                    processed['author'],
+                    processed['song_url'],
+                    processed['likes'],
+                    processed['views'],
+                    processed['upload_date'],
+                    processed['source'],
+                    processed.get('requested_by_name'),
+                    processed.get('requested_by_id'),
+                ), interaction)
                 try:
                     msg = await interaction.channel.send(embed=embed)
                     self.create_background_task(
-                        self.update_progress(msg, embed, next_song_data['duration'])
+                        self.update_progress(msg, embed, processed['duration'])
                     )
                 except Exception as e:
                     print(f"Error sending now playing message: {e}")
-            except Exception as e:
-                print(f"Autoplay error: {e}")
 
         else:
             print("queue stopped")
             queue.playing = False
 
     def create_now_playing_embed(self, metadata, interaction):
-        title, thumbnail, _, duration, author, song_url, likes, views, upload_date = metadata
+        title, thumbnail, _, duration, author, song_url, likes, views, upload_date, source, req_name, req_id = metadata
 
         def format_time(seconds):
             m, s = divmod(int(seconds), 60)
@@ -353,21 +444,63 @@ class MusicCog(commands.Cog):
         fields = [
             ("Artist", f"{author}", True),
             ("Duration", f"{format_time(duration)}", True),
-            ("Link", f"{song_url}", True),
         ]
+
+        source_label = source.get("label", "Unknown")
+        source_icon = source.get("icon", "🔗")
+        fields.append(("Platform", f"{source_icon} {source_label}", True))
+
+        if likes:
+            fields.append(("Likes", f"👍 {likes}", True))
+        if views:
+            fields.append(("Views", f"👁️ {views}", True))
 
         embed = self.make_embed(
             title="Now playing",
-            description=title,
+            description=f"{source_icon} **{title}**",
             color=0x5865F2,
             thumbnail=thumbnail,
-            author_name=f"Requested by {interaction.user.display_name}",
+            author_name=f"Requested by {req_name or interaction.user.display_name}",
             author_icon=safe_avatar(interaction.user),
             footer="Use /skip to go to the next song",
             footer_icon=safe_avatar(self.bot.user),
             fields=[(n, f"```\n{v}\n```", True) for n, v, _ in fields]
         )
         return embed
+
+    async def _ensure_voice(self, interaction, queue):
+        voice_client = interaction.guild.voice_client
+        if not voice_client or not voice_client.is_connected():
+            if not interaction.user.voice:
+                return None
+            channel = interaction.user.voice.channel
+            await channel.connect(self_deaf=True)
+            voice_client = interaction.guild.voice_client
+            if SET_VC_STATUS_TO_MUSIC_PLAYING:
+                current_song = queue.peek()['title'] if queue.peek() else "Music"
+                try:
+                    await voice_client.channel.edit(status=f"Listening to: {current_song}")
+                except Exception:
+                    pass
+        return voice_client
+
+    async def _maybe_play(self, voice_client, queue, interaction, check_empty=True):
+        if not voice_client:
+            return
+        if interaction.user.voice and interaction.user.voice.channel != voice_client.channel:
+            await interaction.followup.send(
+                embed=self.make_embed(
+                    title="Wrong voice channel",
+                    description="You must be in the same voice channel as the bot.",
+                    color=0xe74c3c
+                ),
+                ephemeral=True
+            )
+            return
+        if not voice_client.is_playing() and not voice_client.is_paused():
+            if check_empty and queue.is_empty():
+                return
+            await self.play_next(guild=interaction.guild, voice_client=voice_client, interaction=interaction)
 
     async def update_progress(self, message, embed, duration):
         try:
@@ -382,34 +515,40 @@ class MusicCog(commands.Cog):
         m, s = divmod(int(seconds), 60)
         return f"{m:02}:{s:02}"
 
-    async def process_single_entry(self, entry: dict):
+    async def process_single_entry(self, entry: dict, requester: Optional[discord.abc.User] = None):
         try:
             if not entry or "url" not in entry:
                 print(f"Error processing entry: Missing 'url' key")
                 return None
+
+            source = detect_source_from_entry(entry)
 
             return {
                 'entry_data': entry,
                 'title': entry.get("title", "Unknown title"),
                 'thumbnail': entry.get("thumbnail"),
                 'duration': entry.get("duration", 0),
-                'author': entry.get("uploader", "Unknown author"),
-                'song_url': entry.get("webpage_url", "Unknown URL"),
-                'likes': entry.get("like_count", 0),
-                'views': entry.get("view_count", 0),
-                'upload_date': entry.get("upload_date", "Unknown date")
+                'author': entry.get("uploader") or entry.get("creator") or entry.get("artist") or "Unknown",
+                'song_url': entry.get("webpage_url") or entry.get("original_url") or "Unknown URL",
+                'likes': entry.get("like_count") or 0,
+                'views': entry.get("view_count") or 0,
+                'upload_date': entry.get("upload_date"),
+                'source': source,
+                'requested_by_id': requester.id if requester else 0,
+                'requested_by_name': requester.display_name if requester else "Unknown",
             }
 
         except Exception as e:
             print(f"Error processing entry: {e}")
             return None
 
-    async def process_song_entries(self, entries: List[dict], guild_id: int):
+    async def process_song_entries(self, entries: List[dict], guild_id: int, requester: Optional[discord.abc.User] = None):
         if guild_id not in guild_queues:
             guild_queues[guild_id] = OptimizedQueue()
 
         queue = guild_queues[guild_id]
         processed_songs = []
+        total = len(entries)
 
         batch_size = 5
         for i in range(0, len(entries), batch_size):
@@ -418,7 +557,7 @@ class MusicCog(commands.Cog):
             tasks = []
             for entry in batch:
                 if entry:
-                    tasks.append(self.process_single_entry(entry))
+                    tasks.append(self.process_single_entry(entry, requester))
 
             if tasks:
                 results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -428,7 +567,7 @@ class MusicCog(commands.Cog):
                     processed_songs.append(result)
                     queue.add(result)
 
-        return processed_songs
+        return processed_songs, total - len(processed_songs)
 
     @app_commands.command(name="chart", description="Plays a random song from the YouTube Music charts")
     async def play_chart(self, interaction: discord.Interaction):
@@ -581,7 +720,7 @@ class MusicCog(commands.Cog):
 
         entry = info["entries"][0] if "entries" in info and info["entries"] else info
 
-        processed_song = await self.process_single_entry(entry)
+        processed_song = await self.process_single_entry(entry, requester=interaction.user)
         if processed_song:
             queue.add(processed_song)
             title = processed_song['title']
@@ -615,34 +754,10 @@ class MusicCog(commands.Cog):
             )
             return
 
-        voice_client = interaction.guild.voice_client
-        if not voice_client or not voice_client.is_connected():
-            channel = interaction.user.voice.channel
-            await channel.connect(self_deaf=True)
-            voice_client = interaction.guild.voice_client
-            voice_channel = voice_client.channel
+        voice_client = await self._ensure_voice(interaction, queue)
+        await self._maybe_play(voice_client, queue, interaction)
 
-            if SET_VC_STATUS_TO_MUSIC_PLAYING:
-                current_song = (queue.peek()['title'] if queue.peek() else "Music")
-                try:
-                    await voice_channel.edit(status=f"Listening to: {current_song}")
-                except Exception:
-                    pass
-
-        if voice_client and voice_client.channel and interaction.user.voice.channel != voice_client.channel:
-            await interaction.followup.send(
-                embed=self.make_embed(
-                    title="Wrong voice channel",
-                    description="You must be in the same voice channel as the bot.",
-                    color=0xe74c3c
-                ),
-                ephemeral=True
-            )
-        else:
-            if not queue.playing and not voice_client.is_playing() and not queue.is_empty():
-                await self.play_next(guild=interaction.guild, voice_client=voice_client, interaction=interaction)
-
-    async def insipre_me(self, interaction: discord.Interaction):
+    async def inspire_me(self, interaction: discord.Interaction):
         if await self.check_timeout_decorator(interaction):
             return
         else:
@@ -738,7 +853,7 @@ class MusicCog(commands.Cog):
 
         entry = info["entries"][0] if "entries" in info and info["entries"] else info
 
-        processed_song = await self.process_single_entry(entry)
+        processed_song = await self.process_single_entry(entry, requester=interaction.user)
         if processed_song:
             queue.add(processed_song)
             title = processed_song['title']
@@ -772,32 +887,8 @@ class MusicCog(commands.Cog):
             )
             return
 
-        voice_client = interaction.guild.voice_client
-        if not voice_client or not voice_client.is_connected():
-            channel = interaction.user.voice.channel
-            await channel.connect(self_deaf=True)
-            voice_client = interaction.guild.voice_client
-            voice_channel = voice_client.channel
-
-            if SET_VC_STATUS_TO_MUSIC_PLAYING:
-                current_song = (queue.peek()['title'] if queue.peek() else "Music")
-                try:
-                    await voice_channel.edit(status=f"Listening to: {current_song}")
-                except Exception:
-                    pass
-
-        if voice_client and voice_client.channel and interaction.user.voice.channel != voice_client.channel:
-            await interaction.followup.send(
-                embed=self.make_embed(
-                    title="Wrong voice channel",
-                    description="You must be in the same voice channel as the bot.",
-                    color=0xe74c3c
-                ),
-                ephemeral=True
-            )
-        else:
-            if not queue.playing and not voice_client.is_playing() and not queue.is_empty():
-                await self.play_next(guild=interaction.guild, voice_client=voice_client, interaction=interaction)
+        voice_client = await self._ensure_voice(interaction, queue)
+        await self._maybe_play(voice_client, queue, interaction)
 
     async def mostplayed_callback(self, interaction: discord.Interaction, song: str):
         await interaction.response.defer()
@@ -832,7 +923,7 @@ class MusicCog(commands.Cog):
 
         entry = info["entries"][0] if "entries" in info and info["entries"] else info
 
-        processed_song = await self.process_single_entry(entry)
+        processed_song = await self.process_single_entry(entry, requester=interaction.user)
         if processed_song:
             queue.add(processed_song)
             title = processed_song['title']
@@ -866,36 +957,13 @@ class MusicCog(commands.Cog):
             )
             return
 
-        voice_client = interaction.guild.voice_client
-        if not voice_client or not voice_client.is_connected():
-            channel = interaction.user.voice.channel
-            await channel.connect(self_deaf=True)
-            voice_client = interaction.guild.voice_client
-            voice_channel = voice_client.channel
+        voice_client = await self._ensure_voice(interaction, queue)
+        await self._maybe_play(voice_client, queue, interaction)
 
-            if SET_VC_STATUS_TO_MUSIC_PLAYING:
-                current_song = (queue.peek()['title'] if queue.peek() else "Music")
-                try:
-                    await voice_channel.edit(status=f"Listening to: {current_song}")
-                except Exception:
-                    pass
-
-        if voice_client and voice_client.channel and interaction.user.voice.channel != voice_client.channel:
-            await interaction.followup.send(
-                embed=self.make_embed(
-                    title="Wrong voice channel",
-                    description="You must be in the same voice channel as the bot.",
-                    color=0xe74c3c
-                ),
-                ephemeral=True
-            )
-        else:
-            if not queue.playing and not voice_client.is_playing() and not queue.is_empty():
-                await self.play_next(guild=interaction.guild, voice_client=voice_client, interaction=interaction)
-
-    @app_commands.command(name="play", description="Plays music")
-    @app_commands.describe(song="URL or search term")
-    async def play(self, interaction: discord.Interaction, song: str):
+    @app_commands.command(name="play", description="Plays music from YouTube, Spotify, SoundCloud, Deezer, Tidal and more")
+    @app_commands.describe(song="URL or search term", source="Music source (default: auto)")
+    @app_commands.choices(source=SOURCE_CHOICES)
+    async def play(self, interaction: discord.Interaction, song: str, source: str = "auto"):
         if await self.check_timeout_decorator(interaction):
             return
         else:
@@ -931,22 +999,112 @@ class MusicCog(commands.Cog):
             )
             return
 
+        loading_source = detect_source(song)["label"] if song.startswith("http") else (source.capitalize() if source != "auto" else "YouTube")
         loading_embed = self.make_embed(
             title="Loading",
-            description=f"Searching for: {song}",
+            description=f"Searching {loading_source}: {song}",
             color=0x3498db
         )
         loading_message = await interaction.followup.send(embed=loading_embed)
 
-        search_query = song if song.startswith("http") else f"ytsearch:{song}"
+        is_url = song.startswith("http")
+        if is_url:
+            search_query = song
+        elif source != "auto":
+            prefix = SEARCH_PREFIXES.get(source)
+            if prefix:
+                search_query = f"{prefix}:{song}"
+            else:
+                await interaction.followup.send(
+                    embed=self.make_embed(
+                        title="Unsupported source",
+                        description=f"**{source}** does not support text search. Please provide a direct URL or use a different source.",
+                        color=0xe74c3c
+                    ),
+                    ephemeral=True
+                )
+                try:
+                    await loading_message.delete()
+                except Exception:
+                    pass
+                return
+        else:
+            search_query = f"ytsearch:{song}"
 
         try:
             info = await song_loader.extract_info_async(search_query)
         except Exception as e:
+            err_msg = str(e)[:1500]
+            source_hint = detect_source(song)["label"] if song.startswith("http") else source.capitalize()
+
+            if is_url:
+                if is_playlist(song):
+                    try:
+                        await loading_message.delete()
+                    except Exception:
+                        pass
+                    await interaction.followup.send(
+                        embed=self.make_embed(
+                            title="Unsupported playlist",
+                            description=f"**{source_hint}** playlists and albums are not yet supported.\nPlease use a direct track URL instead.",
+                            color=0xe74c3c
+                        ),
+                        ephemeral=True
+                    )
+                    return
+
+                if needs_resolution(song):
+                    resolved = await resolve_to_search_query(song)
+                    if resolved:
+                        try:
+                            info = await song_loader.extract_info_async(resolved["query"])
+                            if info and not ("entries" in info and not [e for e in info["entries"] if e]):
+                                source_hint = f"{source_hint} → YouTube"
+                            else:
+                                info = None
+                        except Exception:
+                            info = None
+                    else:
+                        info = None
+                    if not info:
+                        try:
+                            await loading_message.delete()
+                        except Exception:
+                            pass
+                        await interaction.followup.send(
+                            embed=self.make_embed(
+                                title="Extraction failed",
+                                description=f"**{source_hint}** could not be processed.\nCould not find this track on YouTube either.\n\n```{err_msg}```",
+                                color=0xe74c3c
+                            ),
+                            ephemeral=True
+                        )
+                        return
+
+            if not info:
+                try:
+                    await loading_message.delete()
+                except Exception:
+                    pass
+                await interaction.followup.send(
+                    embed=self.make_embed(
+                        title="Extraction failed",
+                        description=f"**{source_hint}** could not be processed.\n\n```{err_msg}```",
+                        color=0xe74c3c
+                    ),
+                    ephemeral=True
+                )
+                return
+
+        if not info or ("entries" in info and not [e for e in info["entries"] if e]):
+            try:
+                await loading_message.delete()
+            except Exception:
+                pass
             await interaction.followup.send(
                 embed=self.make_embed(
-                    title="Error",
-                    description=f"Failed to load video/playlist.\n\n{e}",
+                    title="No results",
+                    description=f"No results found for the given input.\nTry a different search term or check the URL.",
                     color=0xe74c3c
                 ),
                 ephemeral=True
@@ -966,7 +1124,7 @@ class MusicCog(commands.Cog):
 
             processing_message = await interaction.channel.send(embed=processing_embed)
 
-            processed_songs = await self.process_song_entries(entries, interaction.guild.id)
+            processed_songs, skipped = await self.process_song_entries(entries, interaction.guild.id, requester=interaction.user)
 
             titles_list = "\n".join([f"- {song['title']}" for song in processed_songs[:10]])
             if len(processed_songs) > 10:
@@ -975,12 +1133,20 @@ class MusicCog(commands.Cog):
             initial_len = max(0, len(queue.queue) - len(processed_songs))
             wait_seconds = sum(song['duration'] for song in queue.queue[:initial_len]) if initial_len > 0 else 0
 
+            first_source = detect_source_from_entry(entries[0]) if entries else detect_source(song)
+            source_icon = first_source.get("icon", "🎵")
+
+            desc = f"{len(processed_songs)} songs added to queue."
+            if skipped > 0:
+                desc += f"\n⚠️ {skipped} song{'s' if skipped != 1 else ''} skipped (unavailable)."
+
             success_embed = self.make_embed(
-                title="Playlist added",
-                description=f"{len(processed_songs)} songs added to queue.\n\n{titles_list}",
+                title=f"{source_icon} Playlist added",
+                description=f"{desc}\n\n{titles_list}",
                 color=0x2ecc71,
                 thumbnail=(entries[0].get("thumbnail") if entries else None),
                 fields=[
+                    ("Platform", f"```\n{first_source['label']}\n```", True),
                     ("Position", f"```\n#{initial_len + 1}\n```", True),
                     ("Estimated time", f"```\n{self.format_time(wait_seconds)}\n```", True),
                 ]
@@ -989,19 +1155,23 @@ class MusicCog(commands.Cog):
             await interaction.channel.send(embed=success_embed)
 
         else:
-            processed_song = await self.process_single_entry(info)
+            processed_song = await self.process_single_entry(info, requester=interaction.user)
             if processed_song:
                 queue.add(processed_song)
                 title = processed_song['title']
                 thumbnail = processed_song['thumbnail']
                 duration = processed_song['duration']
 
+                source_info = detect_source_from_entry(info)
+                source_icon = source_info.get("icon", "🎵")
+
                 success_embed = self.make_embed(
-                    title="Added to queue",
+                    title=f"{source_icon} Added to queue",
                     description=title,
                     color=0x2ecc71,
                     thumbnail=thumbnail,
                     fields=[
+                        ("Platform", f"```\n{source_info['label']}\n```", True),
                         ("Duration", f"```\n{self.format_time(duration)}\n```", True),
                         ("Position", f"```\n#{len(queue.queue)}\n```", True),
                     ]
@@ -1019,22 +1189,8 @@ class MusicCog(commands.Cog):
         except Exception:
             pass
 
-        voice_client = interaction.guild.voice_client
-        if not voice_client or not voice_client.is_connected():
-            channel = interaction.user.voice.channel
-            await channel.connect(self_deaf=True)
-            voice_client = interaction.guild.voice_client
-            voice_channel = voice_client.channel
-
-            if SET_VC_STATUS_TO_MUSIC_PLAYING:
-                current_song = (queue.peek()['title'] if queue.peek() else "Music")
-                try:
-                    await voice_channel.edit(status=f"Listening to: {current_song}")
-                except Exception:
-                    pass
-
-        if not queue.playing and not voice_client.is_playing():
-            await self.play_next(guild=interaction.guild, voice_client=voice_client, interaction=interaction)
+        voice_client = await self._ensure_voice(interaction, queue)
+        await self._maybe_play(voice_client, queue, interaction, check_empty=False)
 
     @app_commands.command(name="skip", description="skips the current song")
     async def skip(self, interaction: discord.Interaction):
@@ -1095,9 +1251,6 @@ class MusicCog(commands.Cog):
             )
 
             await interaction.response.send_message(embed=skip_embed)
-
-        if queue and not queue.playing:
-            await self.play_next(interaction.guild, voice_client, interaction=interaction)
 
     @app_commands.command(name="queue", description="lists queued songs")
     async def list(self, interaction: discord.Interaction):
@@ -1189,7 +1342,7 @@ class MusicCog(commands.Cog):
         queue = guild_queues.get(i.guild.id)
 
         if queue and queue.queue:
-            total_duration = sum(song_data[3] for _source, song_data in queue.queue)
+            total_duration = sum(s['duration'] for s in queue.queue)
             cleared_count = len(queue.queue)
             queue.clear()
         else:
@@ -1276,9 +1429,9 @@ class MusicCog(commands.Cog):
 
         wait_time = 0
         display_count = min(10, len(queue.queue))
-        for i, (source, song_data) in enumerate(queue.queue[:display_count]):
-            title = song_data[0]
-            duration = song_data[3]
+        for i, song_data in enumerate(queue.queue[:display_count]):
+            title = song_data['title']
+            duration = song_data['duration']
 
             embed.add_field(
                 name=f"{i + 1}. {title}",
@@ -1663,7 +1816,7 @@ class MusicCog(commands.Cog):
             )
             return
 
-        if interaction.user.voice.channel != voice_client.channel:
+        if not voice_client or interaction.user.voice.channel != voice_client.channel:
             await interaction.response.send_message(
                 embed=self.make_embed(
                     title="Wrong voice channel",
@@ -1676,6 +1829,17 @@ class MusicCog(commands.Cog):
 
         guild_id = interaction.guild.id
         queue = guild_queues.get(guild_id)
+
+        if not queue or not queue.queue:
+            await interaction.response.send_message(
+                embed=self.make_embed(
+                    title="Queue is empty",
+                    description="Nothing to clear.",
+                    color=0x95a5a6
+                ),
+                ephemeral=True
+            )
+            return
 
         if interaction.user.guild_permissions.kick_members:
             cleared_count = len(queue.queue)
@@ -1902,6 +2066,129 @@ class MusicCog(commands.Cog):
         except Exception:
             await interaction.followup.send(embed=result_embed)
 
+    @app_commands.command(name="volume", description="Set playback volume (0-200%)")
+    @app_commands.describe(level="Volume level (0-200, default 100)")
+    async def volume(self, interaction: discord.Interaction, level: int):
+        voice_client = interaction.guild.voice_client
+        if not voice_client or not voice_client.is_playing():
+            await interaction.response.send_message(
+                embed=self.make_embed(
+                    title="Nothing playing",
+                    description="Play something first with /play.",
+                    color=0xe74c3c
+                ),
+                ephemeral=True
+            )
+            return
+
+        if not interaction.user.voice or interaction.user.voice.channel != voice_client.channel:
+            await interaction.response.send_message(
+                embed=self.make_embed(
+                    title="Wrong voice channel",
+                    description="You must be in the same voice channel as the bot.",
+                    color=0xe74c3c
+                ),
+                ephemeral=True
+            )
+            return
+
+        level = max(0, min(200, level))
+        vol = level / 100.0
+        guild_volumes[interaction.guild.id] = vol
+
+        if voice_client.source and isinstance(voice_client.source, discord.PCMVolumeTransformer):
+            voice_client.source.volume = vol
+
+        embed = self.make_embed(
+            title="Volume changed",
+            description=f"Set volume to **{level}%**",
+            color=0x2ecc71,
+            author_name=interaction.user.display_name,
+            author_icon=safe_avatar(interaction.user),
+            fields=[
+                ("Level", f"```\n{'█' * (level // 10)}{'░' * (20 - level // 10)}\n```" if level > 0 else "```\nMuted\n```", False),
+            ]
+        )
+        await interaction.response.send_message(embed=embed)
+
+    @app_commands.command(name="move", description="Move a song to a different position in the queue")
+    @app_commands.describe(from_position="Current position (1-based)", to_position="Target position (1-based)")
+    async def move_song(self, interaction: discord.Interaction, from_position: int, to_position: int):
+        queue = guild_queues.get(interaction.guild.id)
+        if not queue or not queue.queue:
+            await interaction.response.send_message(
+                embed=self.make_embed(
+                    title="Queue is empty",
+                    description="Nothing to move.",
+                    color=0x95a5a6
+                ),
+                ephemeral=True
+            )
+            return
+
+        voice_client = interaction.guild.voice_client
+        if voice_client and voice_client.channel:
+            if not interaction.user.voice or interaction.user.voice.channel != voice_client.channel:
+                await interaction.response.send_message(
+                    embed=self.make_embed(
+                        title="Wrong voice channel",
+                        description="You must be in the same voice channel as the bot.",
+                        color=0xe74c3c
+                    ),
+                    ephemeral=True
+                )
+                return
+
+        n = len(queue.queue)
+        if from_position < 1 or from_position > n:
+            await interaction.response.send_message(
+                embed=self.make_embed(
+                    title="Invalid position",
+                    description=f"`from` must be between 1 and {n}.",
+                    color=0xe74c3c
+                ),
+                ephemeral=True
+            )
+            return
+
+        if to_position < 1 or to_position > n:
+            await interaction.response.send_message(
+                embed=self.make_embed(
+                    title="Invalid position",
+                    description=f"`to` must be between 1 and {n}.",
+                    color=0xe74c3c
+                ),
+                ephemeral=True
+            )
+            return
+
+        from_idx = from_position - 1
+        to_idx = to_position - 1
+
+        if from_idx == to_idx:
+            await interaction.response.send_message(
+                embed=self.make_embed(
+                    title="Same position",
+                    description="The song is already at that position.",
+                    color=0xf39c12
+                ),
+                ephemeral=True
+            )
+            return
+
+        song = queue.queue.pop(from_idx)
+        queue.queue.insert(to_idx, song)
+
+        embed = self.make_embed(
+            title="Song moved",
+            description=f"**{song['title']}** moved from #{from_position} to #{to_position}.",
+            color=0x2ecc71,
+            thumbnail=song.get('thumbnail'),
+            author_name=interaction.user.display_name,
+            author_icon=safe_avatar(interaction.user),
+        )
+        await interaction.response.send_message(embed=embed)
+
     async def cog_load(self):
         self.bot.tree.add_command(self.play, guild=discord.Object(id=SYNC_SERVER))
         self.bot.tree.add_command(self.skip, guild=discord.Object(id=SYNC_SERVER))
@@ -1911,7 +2198,10 @@ class MusicCog(commands.Cog):
         self.bot.tree.add_command(self.play_chart, guild=discord.Object(id=SYNC_SERVER))
         self.bot.tree.add_command(self.pause, guild=discord.Object(id=SYNC_SERVER))
         self.bot.tree.add_command(self.timeout_user_command, guild=discord.Object(id=SYNC_SERVER))
+        self.bot.tree.add_command(self.untimeout_user, guild=discord.Object(id=SYNC_SERVER))
         self.bot.tree.add_command(self.clear_queue, guild=discord.Object(id=SYNC_SERVER))
+        self.bot.tree.add_command(self.volume, guild=discord.Object(id=SYNC_SERVER))
+        self.bot.tree.add_command(self.move_song, guild=discord.Object(id=SYNC_SERVER))
 
     async def cog_unload(self):
         for task in self.background_tasks:

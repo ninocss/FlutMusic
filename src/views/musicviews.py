@@ -198,7 +198,7 @@ class ActionsView(View):
     async def ran_song(self, interaction: discord.Interaction):
         music_cog: "MusicCog" = self.bot.get_cog("MusicCog")
         if music_cog:
-            await music_cog.insipre_me(interaction)
+            await music_cog.inspire_me(interaction)
         else:
             embed = discord.Embed(
                 title="Error",
