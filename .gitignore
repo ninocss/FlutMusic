@@ -1,0 +1,13 @@
+.env
+python
+test.py
+config/tickets.json
+channel.json
+.venv
+.vscode
+src/__pycache__
+src/cogs/__pycache__
+src/modals/__pycache__
+src/util/__pycache__
+src/views/__pycache__
+timeouts.json
