@@ -11,6 +11,8 @@ from util.constants import *
 from util.music.queue import *
 from modals.embeds import *
 from lang.texts import *
+from views.musicviews import ActionsView
+from util.resolver import resolve_to_search_query, resolve_to_direct_url, needs_resolution, is_playlist
 from views.musicviews import ActionsView, LyricsButtonView, QueueView
 from util.resolver import resolve_to_search_query, needs_resolution, is_playlist
 import json
@@ -18,6 +20,8 @@ import os
 from datetime import datetime, timedelta
 from ytmusicapi import YTMusic
 import re
+#neue resolver
+
 import time
 from collections import deque
 from util.lyrics import fetch_lyrics
@@ -970,79 +974,80 @@ class MusicCog(commands.Cog):
 
         await self._search_and_play(interaction, random_chart_song, color=0x2ecc71)
 
+    RANDOM_PLAYLIST_URL = "https://www.youtube.com/playlist?list=PLla6SkKQuad-Kizph600BnYVuU0r9j-Da"
+
+    async def _fetch_playlist(self):
+        loop = asyncio.get_running_loop()
+        def run():
+            with yt_dlp.YoutubeDL({"extract_flat": True, "quiet": True}) as ydl:
+                return ydl.extract_info(self.RANDOM_PLAYLIST_URL, download=False)
+        return await loop.run_in_executor(song_loader.executor, run)
+
     async def inspire_me(self, interaction: discord.Interaction):
         if await self.check_timeout_decorator(interaction):
             return
         else:
             await interaction.response.defer()
 
-        random_songs = [
-            "Never Gonna Give You Up Rick Astley",
-            "Bohemian Rhapsody Queen",
-            "Imagine Dragons Believer",
-            "The Weeknd Blinding Lights",
-            "Dua Lipa Levitating",
-            "Ed Sheeran Shape of You",
-            "Billie Eilish bad guy",
-            "Post Malone Circles",
-            "Ariana Grande 7 rings",
-            "Drake God's Plan",
-            "Taylor Swift Anti-Hero",
-            "Harry Styles As It Was",
-            "Olivia Rodrigo good 4 u",
-            "Doja Cat Kiss Me More",
-            "The Kid LAROI Stay",
-            "Lil Nas X Industry Baby",
-            "Glass Animals Heat Waves",
-            "Måneskin Beggin",
-            "Adele Easy On Me",
-            "Bruno Mars Uptown Funk",
-            "Queen Don't Stop Me Now",
-            "Journey Don't Stop Believin'",
-            "Michael Jackson Billie Jean",
-            "A-ha Take On Me",
-            "Whitney Houston I Wanna Dance with Somebody (Who Loves Me)",
-            "Toto Africa",
-            "Eurythmics Sweet Dreams (Are Made of This)",
-            "Guns N' Roses Sweet Child O' Mine",
-            "AC/DC Back In Black",
-            "Nirvana Smells Like Teen Spirit",
-            "The Police Every Breath You Take",
-            "Linkin Park In The End",
-            "The Killers Mr. Brightside",
-            "Arctic Monkeys Do I Wanna Know?",
-            "Coldplay Viva La Vida",
-            "Coldplay Yellow",
-            "OneRepublic Counting Stars",
-            "Lewis Capaldi Someone You Loved",
-            "James Arthur Say You Won't Let Go",
-            "Shawn Mendes Señorita",
-            "Miley Cyrus Flowers",
-            "SZA Kill Bill",
-            "Jung Kook Seven",
-            "Elton John Cold Heart",
-            "The Neighbourhood Sweater Weather",
-            "Hozier Take Me to Church",
-            "Lord Huron The Night We Met",
-            "Vance Joy Riptide",
-            "Tones And I Dance Monkey",
-            "Post Malone Rockstar",
-            "The Chainsmokers Closer",
-            "Justin Bieber Sorry",
-            "Shawn Mendes Treat You Better",
-            "Khalid Better",
-            "Cardi B WAP"
-        ]
-
-        random_song = random.choice(random_songs)
-
         loading_embed = self.make_embed(
             title="Loading",
-            description=f"Selected: {random_song}\nPreparing...",
+            description="Fetching random song...",
             color=0x9b59b6
         )
 
         loading_message = await interaction.followup.send(embed=loading_embed)
+
+        try:
+            if not hasattr(self, '_playlist_cache') or not self._playlist_cache:
+                info = await self._fetch_playlist()
+                self._playlist_cache = [e for e in info.get("entries", []) if e.get("title") and e.get("url")]
+
+            if not self._playlist_cache:
+                raise Exception("No songs found in playlist")
+
+            entry = random.choice(self._playlist_cache)
+            song_url = entry["url"]
+
+            info = await song_loader.extract_info_async(song_url)
+        except Exception as e:
+            try:
+                await loading_message.delete()
+            except Exception:
+                pass
+            await interaction.followup.send(
+                embed=self.make_embed(
+                    title="Error",
+                    description=f"Failed to load song.\n\n{e}",
+                    color=0xe74c3c
+                ),
+                ephemeral=True
+            )
+            return
+
+        if interaction.guild.id not in guild_queues:
+            guild_queues[interaction.guild.id] = OptimizedQueue()
+
+        queue = guild_queues[interaction.guild.id]
+
+        entry = info["entries"][0] if "entries" in info and info["entries"] else info
+
+        processed_song = await self.process_single_entry(entry, requester=interaction.user)
+        if processed_song:
+            queue.add(processed_song)
+            title = processed_song['title']
+            thumbnail = processed_song['thumbnail']
+
+            success_embed = self.make_embed(
+                title="Added to queue",
+                description=title,
+                color=0x9b59b6,
+                thumbnail=thumbnail,
+                fields=[
+                    ("Position", f"```\n#{len(queue.queue)}\n```", True)
+                ]
+            )
+
+            await interaction.channel.send(embed=success_embed)
 
         try:
             await loading_message.delete()
@@ -1175,6 +1180,17 @@ class MusicCog(commands.Cog):
                             info = None
                     else:
                         info = None
+                    if not info:
+                        direct_url = await resolve_to_direct_url(song)
+                        if direct_url:
+                            try:
+                                info = await song_loader.extract_info_async(direct_url)
+                                if info and not ("entries" in info and not [e for e in info["entries"] if e]):
+                                    source_hint = f"{source_hint} → YouTube Music"
+                                else:
+                                    info = None
+                            except Exception:
+                                info = None
                     if not info:
                         try:
                             await loading_message.delete()
@@ -1511,18 +1527,40 @@ class MusicCog(commands.Cog):
                 )
                 return
 
-        queue = guild_queues.get(interaction.guild.id)
+        await interaction.response.defer()
 
-        if not queue or not queue.queue:
-            await interaction.response.send_message(
-                embed=self.make_embed(
-                    title="Queue is empty",
-                    description="Nothing to shuffle.",
-                    color=0x95a5a6
-                ),
-                ephemeral=True
-            )
-            return
+        if interaction.guild.id not in guild_queues:
+            guild_queues[interaction.guild.id] = OptimizedQueue()
+
+        queue = guild_queues[interaction.guild.id]
+
+        if not queue.queue:
+            if not hasattr(self, '_playlist_cache') or not self._playlist_cache:
+                info = await self._fetch_playlist()
+                self._playlist_cache = [e for e in info.get("entries", []) if e.get("title") and e.get("url")]
+
+            added = 0
+            for entry in random.sample(self._playlist_cache, min(10, len(self._playlist_cache))):
+                try:
+                    info = await song_loader.extract_info_async(entry["url"])
+                    song_data = info["entries"][0] if "entries" in info and info["entries"] else info
+                    processed = await self.process_single_entry(song_data, requester=interaction.user)
+                    if processed:
+                        queue.add(processed)
+                        added += 1
+                except Exception:
+                    pass
+
+            if not added:
+                await interaction.followup.send(
+                    embed=self.make_embed(
+                        title="Empty queue",
+                        description="Could not fetch any songs.",
+                        color=0xe74c3c
+                    ),
+                    ephemeral=True
+                )
+                return
 
         random.shuffle(queue.queue)
 
@@ -1564,7 +1602,7 @@ class MusicCog(commands.Cog):
                 inline=False
             )
 
-        await interaction.response.send_message(embed=embed)
+        await interaction.followup.send(embed=embed)
 
     @app_commands.command(name="pause", description="Pauses or resumes the playback")
     async def pause(self, interaction: discord.Interaction):
