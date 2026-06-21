@@ -22,15 +22,16 @@ def get_apple_music_track_info(apple_url):
         title_tag = soup.find("meta", property="og:title")
         description_tag = soup.find("meta", property="og:description")
         
-        if title_tag and description_tag:
+        if title_tag:
             song_title = title_tag["content"]
             
-            # Die og:description sieht bei Apple Music meist so aus: "Song · Künstler · Jahr"
-            # Wir splitten am "·", um sauber den Künstlernamen zu extrahieren
-            desc_parts = description_tag["content"].split("·")
-            if len(desc_parts) > 1:
-                artist_name = desc_parts[1].strip()
-                return f"{song_title} {artist_name}"
+            if description_tag:
+                # Die og:description sieht bei Apple Music meist so aus: "Song · Künstler · Jahr"
+                # Wir splitten am "·", um sauber den Künstlernamen zu extrahieren
+                desc_parts = description_tag["content"].split("·")
+                if len(desc_parts) > 1:
+                    artist_name = desc_parts[1].strip()
+                    return f"{song_title} {artist_name}"
             
             return song_title
             

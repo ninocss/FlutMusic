@@ -20,7 +20,6 @@ import os
 from datetime import datetime, timedelta
 from ytmusicapi import YTMusic
 import re
-#neue resolver
 
 import time
 from collections import deque
@@ -1145,67 +1144,56 @@ class MusicCog(commands.Cog):
         else:
             search_query = f"ytsearch:{song}"
 
+        info = None
+        err_msg = None
+        source_hint = detect_source(song)["label"] if is_url else (source.capitalize() if source != "auto" else "YouTube")
+
         try:
             info = await song_loader.extract_info_async(search_query)
         except Exception as e:
             err_msg = str(e)[:1500]
-            source_hint = detect_source(song)["label"] if song.startswith("http") else source.capitalize()
 
-            if is_url:
-                if is_playlist(song):
+        # Try resolver fallback when yt-dlp returns no results
+        if is_url and (not info or ("entries" in info and not [e for e in info["entries"] if e])):
+            if is_playlist(song):
+                try:
+                    await loading_message.delete()
+                except Exception:
+                    pass
+                await interaction.followup.send(
+                    embed=self.make_embed(
+                        title="Unsupported playlist",
+                        description=f"**{source_hint}** playlists and albums are not yet supported.\nPlease use a direct track URL instead.",
+                        color=0xe74c3c
+                    ),
+                    ephemeral=True
+                )
+                return
+
+            if needs_resolution(song):
+                resolved = await resolve_to_search_query(song)
+                if resolved:
                     try:
-                        await loading_message.delete()
+                        info = await song_loader.extract_info_async(resolved["query"])
+                        if info and not ("entries" in info and not [e for e in info["entries"] if e]):
+                            source_hint = f"{source_hint} → YouTube"
+                        else:
+                            info = None
                     except Exception:
-                        pass
-                    await interaction.followup.send(
-                        embed=self.make_embed(
-                            title="Unsupported playlist",
-                            description=f"**{source_hint}** playlists and albums are not yet supported.\nPlease use a direct track URL instead.",
-                            color=0xe74c3c
-                        ),
-                        ephemeral=True
-                    )
-                    return
-
-                if needs_resolution(song):
-                    resolved = await resolve_to_search_query(song)
-                    if resolved:
+                        info = None
+                else:
+                    info = None
+                if not info:
+                    direct_url = await resolve_to_direct_url(song)
+                    if direct_url:
                         try:
-                            info = await song_loader.extract_info_async(resolved["query"])
+                            info = await song_loader.extract_info_async(direct_url)
                             if info and not ("entries" in info and not [e for e in info["entries"] if e]):
-                                source_hint = f"{source_hint} → YouTube"
+                                source_hint = f"{source_hint} → YouTube Music"
                             else:
                                 info = None
                         except Exception:
                             info = None
-                    else:
-                        info = None
-                    if not info:
-                        direct_url = await resolve_to_direct_url(song)
-                        if direct_url:
-                            try:
-                                info = await song_loader.extract_info_async(direct_url)
-                                if info and not ("entries" in info and not [e for e in info["entries"] if e]):
-                                    source_hint = f"{source_hint} → YouTube Music"
-                                else:
-                                    info = None
-                            except Exception:
-                                info = None
-                    if not info:
-                        try:
-                            await loading_message.delete()
-                        except Exception:
-                            pass
-                        await interaction.followup.send(
-                            embed=self.make_embed(
-                                title="Extraction failed",
-                                description=f"**{source_hint}** could not be processed.\nCould not find this track on YouTube either.\n\n```{err_msg}```",
-                                color=0xe74c3c
-                            ),
-                            ephemeral=True
-                        )
-                        return
-
             if not info:
                 try:
                     await loading_message.delete()
@@ -1214,7 +1202,7 @@ class MusicCog(commands.Cog):
                 await interaction.followup.send(
                     embed=self.make_embed(
                         title="Extraction failed",
-                        description=f"**{source_hint}** could not be processed.\n\n```{err_msg}```",
+                        description=f"**{source_hint}** could not be processed.\nCould not find this track on YouTube either.\n\n```{err_msg or 'No data returned'}```",
                         color=0xe74c3c
                     ),
                     ephemeral=True
@@ -1226,14 +1214,24 @@ class MusicCog(commands.Cog):
                 await loading_message.delete()
             except Exception:
                 pass
-            await interaction.followup.send(
-                embed=self.make_embed(
-                    title="No results",
-                    description=f"No results found for the given input.\nTry a different search term or check the URL.",
-                    color=0xe74c3c
-                ),
-                ephemeral=True
-            )
+            if err_msg:
+                await interaction.followup.send(
+                    embed=self.make_embed(
+                        title="Extraction failed",
+                        description=f"**{source_hint}** could not be processed.\n\n```{err_msg}```",
+                        color=0xe74c3c
+                    ),
+                    ephemeral=True
+                )
+            else:
+                await interaction.followup.send(
+                    embed=self.make_embed(
+                        title="No results",
+                        description="No results found for the given input.\nTry a different search term or check the URL.",
+                        color=0xe74c3c
+                    ),
+                    ephemeral=True
+                )
             return
 
         processing_message = None

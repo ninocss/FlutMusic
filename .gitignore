@@ -1,6 +1,5 @@
 .env
 python
-test.py
 config/tickets.json
 channel.json
 .venv
