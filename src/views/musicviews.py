@@ -2,6 +2,7 @@
 import discord
 from discord.ui import View, Button
 from util.constants import *
+from util.lyrics import fetch_lyrics
 from typing import TYPE_CHECKING
 import re
 import logging
@@ -303,3 +304,160 @@ class ActionsView(View):
                 self.prev_btn.disabled = (self.current_page == 0)
                 self.next_btn.disabled = (self.current_page >= self.total_pages - 1)
                 await interaction.response.edit_message(embed=embed, view=self)
+
+
+class LyricsView(View):
+    """Paginated lyrics display view."""
+
+    def __init__(self, lyrics_data: dict, lines_per_page: int = 20):
+        super().__init__(timeout=300)
+        self.lyrics_data = lyrics_data
+        self.lines = lyrics_data['plain_lyrics'].splitlines()
+        self.lines_per_page = lines_per_page
+        self.total_pages = max(1, (len(self.lines) + lines_per_page - 1) // lines_per_page)
+        self.current_page = 0
+
+        self.prev_btn = Button(emoji="⬅️", style=SECONDARY, disabled=True, label="Previous", row=1)
+        self.prev_btn.callback = self._prev_page
+        self.add_item(self.prev_btn)
+
+        self.next_btn = Button(
+            emoji="➡️", style=SECONDARY,
+            disabled=(self.total_pages <= 1),
+            label="Next", row=1
+        )
+        self.next_btn.callback = self._next_page
+        self.add_item(self.next_btn)
+
+        self.close_btn = Button(emoji="✖️", style=DANGER, label="Close", row=1)
+        self.close_btn.callback = self._close
+        self.add_item(self.close_btn)
+
+    def create_page_embed(self, page: int = 0) -> discord.Embed:
+        start = page * self.lines_per_page
+        end = start + self.lines_per_page
+        page_text = "\n".join(self.lines[start:end])
+        if not page_text.strip():
+            page_text = "*(empty lines)*"
+
+        embed = discord.Embed(
+            title=f"🎤 {self.lyrics_data['track_name']}",
+            description=f"**{self.lyrics_data['artist_name']}**\n\n{page_text}",
+            color=0x9b59b6
+        )
+        embed.set_footer(text=f"Page {page + 1}/{self.total_pages} • Lyrics via lrclib.net")
+        embed.timestamp = discord.utils.utcnow()
+        return embed
+
+    async def _prev_page(self, interaction: discord.Interaction):
+        if self.current_page > 0:
+            self.current_page -= 1
+            self.prev_btn.disabled = (self.current_page == 0)
+            self.next_btn.disabled = (self.current_page >= self.total_pages - 1)
+            await interaction.response.edit_message(
+                embed=self.create_page_embed(self.current_page), view=self
+            )
+
+    async def _next_page(self, interaction: discord.Interaction):
+        if self.current_page < self.total_pages - 1:
+            self.current_page += 1
+            self.prev_btn.disabled = (self.current_page == 0)
+            self.next_btn.disabled = (self.current_page >= self.total_pages - 1)
+            await interaction.response.edit_message(
+                embed=self.create_page_embed(self.current_page), view=self
+            )
+
+    async def _close(self, interaction: discord.Interaction):
+        try:
+            await interaction.message.delete()
+        except Exception:
+            pass
+        self.stop()
+
+
+class LyricsButtonView(View):
+    """View with a Lyrics button, attached to Now Playing embeds."""
+
+    def __init__(self, music_cog, song_title: str, song_artist: str):
+        super().__init__(timeout=600)
+        self.music_cog = music_cog
+        self.song_title = song_title
+        self.song_artist = song_artist
+
+    @discord.ui.button(label="Lyrics", emoji="🎤", style=PURPLE)
+    async def lyrics_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        button.disabled = True
+        await interaction.response.edit_message(view=self)
+
+        loading_embed = discord.Embed(
+            title="🎤 Fetching Lyrics...",
+            description=f"Searching for lyrics for **{self.song_title}**...",
+            color=0x3498db
+        )
+        await interaction.followup.send(embed=loading_embed, ephemeral=True)
+
+        lyrics_data = await fetch_lyrics(self.song_title, self.song_artist)
+
+        if not lyrics_data:
+            not_found = discord.Embed(
+                title="🎤 Lyrics Not Found",
+                description=f"Could not find lyrics for **{self.song_title}**.",
+                color=0xe74c3c
+            )
+            try:
+                await interaction.edit_original_response(embed=not_found)
+            except Exception:
+                pass
+            return
+
+        view = LyricsView(lyrics_data)
+        embed = view.create_page_embed(0)
+        try:
+            await interaction.edit_original_response(embed=embed, view=view)
+        except Exception:
+            await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+
+
+class QueueView(View):
+    """Paginated queue display view."""
+
+    def __init__(self, queue_items: list, make_embed_fn, items_per_page: int = 10):
+        super().__init__(timeout=300)
+        self.queue_items = queue_items
+        self.make_embed_fn = make_embed_fn
+        self.items_per_page = items_per_page
+        self.total_pages = max(1, (len(queue_items) + items_per_page - 1) // items_per_page)
+        self.current_page = 0
+
+        self.prev_btn = Button(emoji="⬅️", style=SECONDARY, disabled=True, label="Previous", row=1)
+        self.prev_btn.callback = self._prev_page
+        self.add_item(self.prev_btn)
+
+        self.next_btn = Button(
+            emoji="➡️", style=SECONDARY,
+            disabled=(self.total_pages <= 1),
+            label="Next", row=1
+        )
+        self.next_btn.callback = self._next_page
+        self.add_item(self.next_btn)
+
+    def create_page_embed(self, page: int = 0) -> discord.Embed:
+        return self.make_embed_fn(page)
+
+    async def _prev_page(self, interaction: discord.Interaction):
+        if self.current_page > 0:
+            self.current_page -= 1
+            self.prev_btn.disabled = (self.current_page == 0)
+            self.next_btn.disabled = (self.current_page >= self.total_pages - 1)
+            await interaction.response.edit_message(
+                embed=self.create_page_embed(self.current_page), view=self
+            )
+
+    async def _next_page(self, interaction: discord.Interaction):
+        if self.current_page < self.total_pages - 1:
+            self.current_page += 1
+            self.prev_btn.disabled = (self.current_page == 0)
+            self.next_btn.disabled = (self.current_page >= self.total_pages - 1)
+            await interaction.response.edit_message(
+                embed=self.create_page_embed(self.current_page), view=self
+            )
