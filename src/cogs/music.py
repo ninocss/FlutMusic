@@ -20,7 +20,6 @@ import os
 from datetime import datetime, timedelta
 from ytmusicapi import YTMusic
 import re
-#neue resolver
 
 import time
 from collections import deque
