@@ -28,10 +28,10 @@ DIRECT_RESOLVERS = {
 }
 
 SUPPORTED_PATTERNS = {
-    "tidal.com": re.compile(r'tidal\.com/(browse/)?track/\d+', re.I),
-    "music.apple.com": re.compile(r'music\.apple\.com/\w+/album/[\w-]+/\d+\?i=\d+', re.I),
-    "deezer.com": re.compile(r'deezer\.com/(\w+/)?track/\d+', re.I),
-    "open.spotify.com": re.compile(r'open\.spotify\.com/track/\w+', re.I),
+    "tidal.com": re.compile(r'(stage\.)?tidal\.com/(browse/)?track/\d+(/u)?', re.I),
+    "music.apple.com": re.compile(r'music\.apple\.com/\w+/(album/[\w-]+/\d+\?i=\d+|song/[\w-]+/\d+)', re.I),
+    "deezer.com": re.compile(r'(link\.)?deezer\.com/(\w+/)?(track|s)/\w+', re.I),
+    "open.spotify.com": re.compile(r'open\.spotify\.com/([a-z]{2,4}-[a-z]{2}/)?track/\w+', re.I),
 }
 
 def needs_resolution(url: str) -> bool:
@@ -43,15 +43,15 @@ def needs_resolution(url: str) -> bool:
     return False
 
 def is_playlist(url: str) -> bool:
-    if re.search(r'tidal\.com/(browse/)?(playlist|album)/', url, re.I):
+    if re.search(r'(stage\.)?tidal\.com/(browse/)?(playlist|album)/', url, re.I):
         return True
     if re.search(r'music\.apple\.com/\w+/playlist/', url, re.I):
         return True
     if re.search(r'music\.apple\.com/\w+/album/', url, re.I) and '?i=' not in url:
         return True
-    if re.search(r'deezer\.com/(\w+/)?(playlist|album)/', url, re.I):
+    if re.search(r'(link\.)?deezer\.com/(\w+/)?(playlist|album)/', url, re.I):
         return True
-    if re.search(r'open\.spotify\.com/(playlist|album)/', url, re.I):
+    if re.search(r'open\.spotify\.com/([a-z]{2,4}-[a-z]{2}/)?(playlist|album)/', url, re.I):
         return True
     return False
 
