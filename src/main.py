@@ -8,10 +8,8 @@ from discord import Intents
 from discord.ext import commands
 
 from util.constants import *
-from cogs.github import GithubCog
 from cogs.music import MusicCog
 from cogs.radio import RadioCog
-from cogs.guess_the_number import GuessNumberCog
 from cogs.updater import UpdaterCog
 
 # Setup colored logging

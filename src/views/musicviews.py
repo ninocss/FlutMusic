@@ -48,26 +48,22 @@ class ActionsView(View):
         self.bot = bot
         self.song_history = []
 
-        ins_song_btn = Button(label="Inspire Me", emoji="✨", style=GREEN, custom_id="ran_song_btn", row=0)
-        ins_song_btn.callback = self.ran_song
+        help_btn = Button(label="Help & Commands", emoji="❓", style=PURPLE, custom_id="help_btn", row=0)
+        help_btn.callback = self.help_callback
+        self.add_item(help_btn)
 
-        mostplayed_btn = Button(label="Most Played", emoji="🏆", style=PURPLE, custom_id="mostplayed_btn", row=0)
-        mostplayed_btn.callback = self.mostplayed
-
-        charts_btn = Button(label="Charts", emoji="🎶", style=SECONDARY, custom_id="charts_btn", row=1)
-        charts_btn.callback = self.charts_song
-
-        history_btn = Button(label="History", emoji="📖", style=SECONDARY, custom_id="history_btn", row=1)
-        history_btn.callback = self.history_call
-
-        playlist_btn = Button(label="Playlist Shuffle", emoji="🎲", style=GREEN, custom_id="playlist_shuffle_btn", row=2)
-        playlist_btn.callback = self.playlist_shuffle
-
-        self.add_item(ins_song_btn)
-        self.add_item(mostplayed_btn)
-        self.add_item(charts_btn)
-        self.add_item(history_btn)
-        self.add_item(playlist_btn)
+    async def help_callback(self, interaction: discord.Interaction):
+        embed = discord.Embed(
+            title="📚 All Commands Explained",
+            description="Here is a detailed list of what each command does:",
+            color=0x5865F2
+        )
+        embed.add_field(name="🎧 Playback", value="`/play <url/search>` - Plays a song from YouTube, Spotify, etc.\n`/pause` - Pauses/resumes the playback\n`/stop` - Stops music and disconnects the bot\n`/skip` - Skips the current song\n`/volume <0-200>` - Sets the playback volume\n`/playing` - Shows the current song and lyrics\n`/seek <time>` - Jumps to a specific time in the song\n`/loop` - Toggles loop mode (off/song/queue)\n`/radio` - Plays a radio stream", inline=False)
+        embed.add_field(name="📋 Queue", value="`/queue` - Lists all queued songs\n`/shuffle` - Shuffles the current queue\n`/clearqueue` - Votes to clear the entire queue\n`/move <from> <to>` - Moves a song in the queue\n`/remove <position>` - Removes a song from the queue\n`/chart` - Plays a random song from the YouTube Music charts", inline=False)
+        embed.add_field(name="🎵 Playlists", value="`/playlist create <name>` - Creates a personal playlist\n`/playlist add <name> <url>` - Adds a song to your playlist\n`/playlist list` - Lists all your playlists\n`/playlist play <name>` - Plays your saved playlist\n`/playlist import <url>` - Imports a YouTube/Spotify playlist\n`/playlist delete <name>` - Deletes a playlist", inline=False)
+        embed.add_field(name="🛡️ Moderation", value="`/musicmute <user>` - Prevents a user from using music commands\n`/unmusicmute <user>` - Removes the restriction from a user", inline=False)
+        
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
     async def mostplayed(self, interaction: discord.Interaction):
         history = await self.get_history(interaction)

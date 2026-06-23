@@ -1,20 +1,21 @@
 import asyncio
 import re
-import requests
+import aiohttp
 from bs4 import BeautifulSoup
 from typing import Optional, List
 from ytmusicapi import YTMusic
 
-def get_spotify_track_info(spotify_url):
+async def get_spotify_track_info(spotify_url):
     # Täuscht einen echten Browser vor
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-    response = requests.get(spotify_url, headers=headers)
-    
-    if response.status_code != 200:
-        return None
+    async with aiohttp.ClientSession() as session:
+        async with session.get(spotify_url, headers=headers) as response:
+            if response.status != 200:
+                return None
+            html = await response.text()
 
     # HTML parsen
-    soup = BeautifulSoup(response.text, 'html.parser')
+    soup = BeautifulSoup(html, 'html.parser')
     
     # Spotify speichert den Titel oft im <title> Tag oder in OpenGraph Meta-Tags
     title_tag = soup.find("meta", property="og:title")
@@ -34,9 +35,9 @@ def get_spotify_track_info(spotify_url):
 
     return None
 
-def convert_link(spotify_url):
+async def convert_link(spotify_url):
     print("Extrahiere Song-Infos von Spotify...")
-    search_query = get_spotify_track_info(spotify_url)
+    search_query = await get_spotify_track_info(spotify_url)
     
     if not search_query:
         return "Fehler: Song-Infos konnten nicht von Spotify gelesen werden."
@@ -44,8 +45,9 @@ def convert_link(spotify_url):
     print(f"Suche auf YouTube Music nach: '{search_query}'")
     
     # YTMusic ohne auth.json initialisieren (nur für die Suche reicht das!)
+    loop = asyncio.get_event_loop()
     yt = YTMusic()
-    search_results = yt.search(query=search_query, filter="songs")
+    search_results = await loop.run_in_executor(None, lambda: yt.search(query=search_query, filter="songs"))
     
     if search_results:
         video_id = search_results[0]['videoId']
@@ -54,8 +56,7 @@ def convert_link(spotify_url):
         return "Song wurde auf YouTube Music nicht gefunden."
 
 async def resolve(url: str) -> Optional[dict]:
-    loop = asyncio.get_event_loop()
-    query = await loop.run_in_executor(None, get_spotify_track_info, url)
+    query = await get_spotify_track_info(url)
     if not query:
         return None
     parts = [p.strip() for p in query.replace(" - ", "||").split("||")]
@@ -72,27 +73,26 @@ async def resolve(url: str) -> Optional[dict]:
         "source_name": "Spotify",
     }
 
-def _search_ytmusic(url: str) -> Optional[str]:
-    query = get_spotify_track_info(url)
+async def resolve_direct(url: str) -> Optional[str]:
+    query = await get_spotify_track_info(url)
     if not query:
         return None
+    loop = asyncio.get_event_loop()
     yt = YTMusic()
-    results = yt.search(query=query, filter="songs")
+    results = await loop.run_in_executor(None, lambda: yt.search(query=query, filter="songs"))
     if results:
         return f"https://music.youtube.com/watch?v={results[0]['videoId']}"
     return None
 
-async def resolve_direct(url: str) -> Optional[str]:
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _search_ytmusic, url)
-
-
-def get_spotify_playlist_tracks(url: str) -> Optional[List[str]]:
+async def get_spotify_playlist_tracks(url: str) -> Optional[List[str]]:
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-    response = requests.get(url, headers=headers)
-    if response.status_code != 200:
-        return None
-    soup = BeautifulSoup(response.text, 'html.parser')
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, headers=headers) as response:
+            if response.status != 200:
+                return None
+            html = await response.text()
+            
+    soup = BeautifulSoup(html, 'html.parser')
     track_urls = []
     seen = set()
     track_pattern = re.compile(r'open\.spotify\.com/([a-z]{2,4}-[a-z]{2}/)?track/\w+', re.I)
@@ -118,10 +118,8 @@ def get_spotify_playlist_tracks(url: str) -> Optional[List[str]]:
                     track_urls.append(full_url)
     return track_urls[:50] if track_urls else None
 
-
 async def resolve_playlist(url: str) -> Optional[List[dict]]:
-    loop = asyncio.get_event_loop()
-    track_urls = await loop.run_in_executor(None, get_spotify_playlist_tracks, url)
+    track_urls = await get_spotify_playlist_tracks(url)
     if not track_urls:
         return None
     tasks = [resolve(t) for t in track_urls]

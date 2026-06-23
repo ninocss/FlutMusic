@@ -202,22 +202,35 @@ class MusicCog(commands.Cog):
         task.add_done_callback(self.background_tasks.discard)
         return task
 
+    async def _delayed_cleanup_task(self, guild_id):
+        try:
+            await asyncio.sleep(120)
+            
+            # Check if bot has rejoined the voice channel
+            guild = self.bot.get_guild(guild_id)
+            if guild and guild.voice_client and guild.voice_client.is_connected():
+                return
+                
+            channel = await self.bot.fetch_channel(I_CHANNEL)
+            if channel:
+                await channel.send("s!purge 1d")
+                await asyncio.sleep(5)
+                await self.send_static_message()
+        except Exception as e:
+            logger.error(f"Error during delayed cleanup: {e}")
+
     async def send_static_message(self):
         try:
             actions_embed = self.make_embed(
                 title="Music Controls",
-                description="Use the commands below to control music.",
+                description="Here are all available commands:",
                 color=0x5865F2,
                 thumbnail=safe_avatar(self.bot.user),
-                footer=f"Serving {len(self.bot.users)} users",
                 footer_icon=safe_avatar(self.bot.user),
                 fields=[
-                    ("Commands",
-                     "```\n/play <url|search>\n/playing\n/queue\n/skip\n/pause\n/shuffle\n/stop\n/volume\n/move\n/chart\n/clearqueue\n/seek\n/loop\n/remove\n```",
-                     False),
-                    ("Status",
-                     f"```\nServers: {len(self.bot.guilds)}\nUsers: {len(self.bot.users)}\n```",
-                     True)
+                    ("🎧 Playback", "`/play` `/pause` `/stop` `/skip` `/volume` `/playing` `/seek` `/loop` `/radio`", False),
+                    ("📋 Queue", "`/queue` `/shuffle` `/clearqueue` `/move` `/remove` `/chart`", False),
+                    ("🎵 Playlists", "`/playlist create` `/playlist add` `/playlist list` `/playlist play` `/playlist import` `/playlist delete`", False),
                 ]
             )
 
@@ -1800,12 +1813,8 @@ class MusicCog(commands.Cog):
                 queue.playing = False
                 del guild_queues[guild_id]
             self.currently_playing.pop(guild_id, None)
-            try:
-                channel = await self.bot.fetch_channel(I_CHANNEL)
-                if channel:
-                    await self.send_static_message()
-            except Exception as e:
-                logger.error(f"Error sending disconnect message: {e}")
+            
+            self.bot.loop.create_task(self._delayed_cleanup_task(guild_id))
             return
 
         # Handle users leaving voice channel (auto-disconnect when empty)
@@ -1835,14 +1844,6 @@ class MusicCog(commands.Cog):
                             except Exception:
                                 pass
                             await voice_client.disconnect(force=True)
-                            try:
-                                channel = await self.bot.fetch_channel(I_CHANNEL)
-                                if channel:
-                                    await self.send_static_message()
-                                else:
-                                    logger.error(f"Error: Channel with ID {I_CHANNEL} not found after fetch.")
-                            except Exception as e:
-                                logger.error(f"Error sending auto-disconnect message: {e}")
 
     @app_commands.command(name="musicmute", description="Timeout a user from using music commands")
     @app_commands.describe(user="The user to timeout", duration="Duration in minutes")

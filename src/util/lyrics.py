@@ -54,13 +54,13 @@ async def fetch_lyrics(track: str, artist: str = "") -> dict | None:
     ) as session:
         # Strategy 1: search with combined query
         combined = f"{artist} {track}".strip() if artist else track
-        result = await _lrclib_search(session, combined)
+        result = await _lrclib_search(session, combined, track, artist)
         if result:
             return result
 
         # Strategy 2: search with track only
         if artist:
-            result = await _lrclib_search(session, track)
+            result = await _lrclib_search(session, track, track, artist)
             return result
 
         return None
@@ -68,7 +68,9 @@ async def fetch_lyrics(track: str, artist: str = "") -> dict | None:
 
 async def _lrclib_search(
     session: aiohttp.ClientSession,
-    query: str
+    query: str,
+    track: str,
+    artist: str
 ) -> dict | None:
     """Try a single lrclib.net search and return lyrics dict or None."""
     params = {'q': query}

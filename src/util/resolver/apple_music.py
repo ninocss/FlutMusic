@@ -1,12 +1,12 @@
 import asyncio
 import re
 import json
-import requests
+import aiohttp
 from bs4 import BeautifulSoup
 from typing import Optional, List
 from ytmusicapi import YTMusic
 
-def get_apple_music_track_info(apple_url):
+async def get_apple_music_track_info(apple_url):
     """Extrahiert Songtitel und Künstler anonym aus einem Apple Music Link"""
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -14,11 +14,13 @@ def get_apple_music_track_info(apple_url):
     }
     
     try:
-        response = requests.get(apple_url, headers=headers)
-        if response.status_code != 200:
-            return None
+        async with aiohttp.ClientSession() as session:
+            async with session.get(apple_url, headers=headers) as response:
+                if response.status != 200:
+                    return None
+                html = await response.text()
 
-        soup = BeautifulSoup(response.text, 'html.parser')
+        soup = BeautifulSoup(html, 'html.parser')
         
         # Apple Music nutzt vorbildliche OpenGraph-Tags für Titel und Beschreibung
         title_tag = soup.find("meta", property="og:title")
@@ -42,10 +44,10 @@ def get_apple_music_track_info(apple_url):
         
     return None
 
-def convert_apple_to_youtube(apple_url):
+async def convert_apple_to_youtube(apple_url):
     # 1. Infos von Apple Music holen
     print("Extrahiere Song-Infos von Apple Music...")
-    search_query = get_apple_music_track_info(apple_url)
+    search_query = await get_apple_music_track_info(apple_url)
     
     if not search_query:
         return "Fehler: Song-Infos konnten von Apple Music nicht gelesen werden."
@@ -53,8 +55,9 @@ def convert_apple_to_youtube(apple_url):
     print(f"Suche auf YouTube Music nach: '{search_query}'")
     
     # 2. Auf YouTube Music suchen
+    loop = asyncio.get_event_loop()
     yt = YTMusic()
-    search_results = yt.search(query=search_query, filter="songs")
+    search_results = await loop.run_in_executor(None, lambda: yt.search(query=search_query, filter="songs"))
     
     # 3. Ergebnis auswerten
     if search_results:
@@ -69,8 +72,7 @@ def convert_apple_to_youtube(apple_url):
         return "Song wurde auf YouTube Music leider nicht gefunden."
 
 async def resolve(url: str) -> Optional[dict]:
-    loop = asyncio.get_event_loop()
-    query = await loop.run_in_executor(None, get_apple_music_track_info, url)
+    query = await get_apple_music_track_info(url)
     if not query:
         return None
     parts = [p.strip() for p in query.replace(" - ", "||").split("||")]
@@ -87,30 +89,34 @@ async def resolve(url: str) -> Optional[dict]:
         "source_name": "Apple Music",
     }
 
-def _search_ytmusic(url: str) -> Optional[str]:
-    query = get_apple_music_track_info(url)
+async def resolve_direct(url: str) -> Optional[str]:
+    query = await get_apple_music_track_info(url)
     if not query:
         return None
+    loop = asyncio.get_event_loop()
     yt = YTMusic()
-    results = yt.search(query=query, filter="songs")
+    results = await loop.run_in_executor(None, lambda: yt.search(query=query, filter="songs"))
     if results:
         return f"https://music.youtube.com/watch?v={results[0]['videoId']}"
     return None
 
-async def resolve_direct(url: str) -> Optional[str]:
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _search_ytmusic, url)
-
-
-def get_apple_music_playlist_info(url: str) -> Optional[List[dict]]:
+async def get_apple_music_playlist_info(url: str) -> Optional[List[dict]]:
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Accept-Language": "de-DE,de;q=0.9",
     }
-    response = requests.get(url, headers=headers)
-    if response.status_code != 200:
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers) as response:
+                if response.status != 200:
+                    return None
+                html = await response.text()
+    except Exception as e:
+        print(f"Fehler beim Scraping von Apple Music Playlist: {e}")
         return None
-    soup = BeautifulSoup(response.text, 'html.parser')
+        
+    soup = BeautifulSoup(html, 'html.parser')
 
     # Try JSON-LD structured data first
     for script in soup.find_all('script', type='application/ld+json'):
@@ -174,7 +180,7 @@ def get_apple_music_playlist_info(url: str) -> Optional[List[dict]]:
         tracks = []
         for tid in list(track_ids)[:50]:
             track_url = f'{base_album_url}?i={tid}'
-            track_info = get_apple_music_track_info(track_url)
+            track_info = await get_apple_music_track_info(track_url)
             if track_info:
                 parts = [p.strip() for p in track_info.replace(" - ", "||").split("||")]
                 title = parts[1] if len(parts) >= 2 else parts[0]
@@ -188,10 +194,8 @@ def get_apple_music_playlist_info(url: str) -> Optional[List[dict]]:
 
     return None
 
-
 async def resolve_playlist(url: str) -> Optional[List[dict]]:
-    loop = asyncio.get_event_loop()
-    track_infos = await loop.run_in_executor(None, get_apple_music_playlist_info, url)
+    track_infos = await get_apple_music_playlist_info(url)
     if not track_infos:
         return None
     results = []
