@@ -464,6 +464,8 @@ class MusicCog(commands.Cog):
                 )
             except Exception as e:
                 logger.error(f"Error sending now playing message: {e}")
+
+            await self._set_song_activity(next_song_data['title'], next_song_data['author'])
         elif AUTO_PLAY_ENABLED:
             logger.info("autoplaying")
             song_link = None
@@ -640,10 +642,13 @@ class MusicCog(commands.Cog):
                 except Exception as e:
                     logger.error(f"Error sending now playing message: {e}")
 
+                await self._set_song_activity(processed['title'], processed['author'])
+
         else:
             logger.info("queue stopped")
             queue.playing = False
             self.currently_playing.pop(guild.id, None)
+            await self._reset_activity()
 
     def create_now_playing_embed(self, metadata, interaction):
         title, thumbnail, _, duration, author, song_url, likes, views, upload_date, source, req_name, req_id = metadata
@@ -686,6 +691,28 @@ class MusicCog(commands.Cog):
                     return s
             return {"label": original_source_name, "icon": "🔗", "extractor": None}
         return detect_source(url)
+
+    async def _set_song_activity(self, title: str, author: str):
+        try:
+            await self.bot.change_presence(
+                activity=discord.Activity(
+                    name=f"{title} - {author}",
+                    type=discord.ActivityType.playing
+                )
+            )
+        except Exception:
+            pass
+
+    async def _reset_activity(self):
+        try:
+            await self.bot.change_presence(
+                activity=discord.Activity(
+                    name="/github • /play",
+                    type=discord.ActivityType.competing
+                )
+            )
+        except Exception:
+            pass
 
     async def _ensure_voice(self, interaction, queue):
         voice_client = interaction.guild.voice_client
@@ -1588,6 +1615,7 @@ class MusicCog(commands.Cog):
                 pass
             await i.guild.voice_client.disconnect()
             self.currently_playing.pop(i.guild.id, None)
+            await self._reset_activity()
             await i.response.send_message(embed=embed)
             await self.send_static_message()
         else:
