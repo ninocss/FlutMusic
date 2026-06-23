@@ -1,7 +1,9 @@
 import asyncio
+import re
+import json
 import requests
 from bs4 import BeautifulSoup
-from typing import Optional
+from typing import Optional, List
 from ytmusicapi import YTMusic
 
 def get_apple_music_track_info(apple_url):
@@ -98,3 +100,114 @@ def _search_ytmusic(url: str) -> Optional[str]:
 async def resolve_direct(url: str) -> Optional[str]:
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, _search_ytmusic, url)
+
+
+def get_apple_music_playlist_info(url: str) -> Optional[List[dict]]:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept-Language": "de-DE,de;q=0.9",
+    }
+    response = requests.get(url, headers=headers)
+    if response.status_code != 200:
+        return None
+    soup = BeautifulSoup(response.text, 'html.parser')
+
+    # Try JSON-LD structured data first
+    for script in soup.find_all('script', type='application/ld+json'):
+        try:
+            data = json.loads(script.string)
+            if isinstance(data, dict):
+                items = data.get('track', data.get('itemListElement', []))
+                if isinstance(items, list) and items:
+                    tracks = []
+                    for item in items:
+                        if isinstance(item, dict):
+                            track_name = item.get('name') or (item.get('item', {}) if isinstance(item.get('item'), dict) else {}).get('name')
+                            artist_name = None
+                            if 'byArtist' in item:
+                                artist = item['byArtist']
+                                if isinstance(artist, dict):
+                                    artist_name = artist.get('name')
+                                elif isinstance(artist, list) and artist:
+                                    artist_name = artist[0].get('name') if isinstance(artist[0], dict) else None
+                            if track_name:
+                                tracks.append({
+                                    'title': track_name,
+                                    'artist': artist_name or '',
+                                })
+                    if tracks:
+                        return tracks
+            elif isinstance(data, list):
+                tracks = []
+                for item in data:
+                    if isinstance(item, dict) and item.get('@type') == 'MusicRecording':
+                        track_name = item.get('name')
+                        artist_name = None
+                        if 'byArtist' in item:
+                            artist = item['byArtist']
+                            if isinstance(artist, dict):
+                                artist_name = artist.get('name')
+                        if track_name:
+                            tracks.append({
+                                'title': track_name,
+                                'artist': artist_name or '',
+                            })
+                if tracks:
+                    return tracks
+        except (json.JSONDecodeError, AttributeError):
+            continue
+
+    # Fallback: find track URLs with ?i= param and scrape each
+    # Build track URL from the album URL + ?i=track_id
+    album_url_match = re.match(r'(https?://music\.apple\.com/\w+/album/[^/]+/\d+)', url)
+    base_album_url = album_url_match.group(1) if album_url_match else url.rstrip('/')
+
+    track_ids = set()
+    i_pattern = re.compile(r'[?&]i=(\d+)')
+    for link in soup.find_all('a', href=True):
+        href = link['href']
+        match = i_pattern.search(href)
+        if match:
+            track_ids.add(match.group(1))
+
+    if track_ids:
+        tracks = []
+        for tid in list(track_ids)[:50]:
+            track_url = f'{base_album_url}?i={tid}'
+            track_info = get_apple_music_track_info(track_url)
+            if track_info:
+                parts = [p.strip() for p in track_info.replace(" - ", "||").split("||")]
+                title = parts[1] if len(parts) >= 2 else parts[0]
+                artist = parts[0] if len(parts) >= 2 else ""
+                tracks.append({
+                    'title': title,
+                    'artist': artist,
+                })
+        if tracks:
+            return tracks
+
+    return None
+
+
+async def resolve_playlist(url: str) -> Optional[List[dict]]:
+    loop = asyncio.get_event_loop()
+    track_infos = await loop.run_in_executor(None, get_apple_music_playlist_info, url)
+    if not track_infos:
+        return None
+    results = []
+    for ti in track_infos:
+        artist = ti.get('artist', '') or ''
+        title = ti.get('title', '') or ''
+        if not title:
+            continue
+        query = f"{title} {artist}".strip()
+        parts = [p.strip() for p in query.replace(" - ", "||").split("||")]
+        t = parts[1] if len(parts) >= 2 else parts[0]
+        a = parts[0] if len(parts) >= 2 else ""
+        results.append({
+            "query": f"ytsearch:{query}",
+            "title": t,
+            "artist": a,
+            "source_name": "Apple Music",
+        })
+    return results if results else None

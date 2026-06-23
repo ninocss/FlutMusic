@@ -12,6 +12,7 @@ from cogs.github import GithubCog
 from cogs.music import MusicCog
 from cogs.radio import RadioCog
 from cogs.guess_the_number import GuessNumberCog
+from cogs.updater import UpdaterCog
 
 # Setup colored logging
 def setup_logging() -> logging.Logger:
@@ -58,7 +59,8 @@ class Bot(commands.Bot):
             GithubCog(self),
             MusicCog(self),
             RadioCog(self),
-            GuessNumberCog(self)
+            GuessNumberCog(self),
+            UpdaterCog(self)
         ]
         
         for cog in cogs:

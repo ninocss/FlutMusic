@@ -60,10 +60,14 @@ class ActionsView(View):
         history_btn = Button(label="History", emoji="📖", style=SECONDARY, custom_id="history_btn", row=1)
         history_btn.callback = self.history_call
 
+        playlist_btn = Button(label="Playlist Shuffle", emoji="🎲", style=GREEN, custom_id="playlist_shuffle_btn", row=2)
+        playlist_btn.callback = self.playlist_shuffle
+
         self.add_item(ins_song_btn)
         self.add_item(mostplayed_btn)
         self.add_item(charts_btn)
         self.add_item(history_btn)
+        self.add_item(playlist_btn)
 
     async def mostplayed(self, interaction: discord.Interaction):
         history = await self.get_history(interaction)
@@ -200,6 +204,18 @@ class ActionsView(View):
         music_cog: "MusicCog" = self.bot.get_cog("MusicCog")
         if music_cog:
             await music_cog.inspire_me(interaction)
+        else:
+            embed = discord.Embed(
+                title="Error",
+                description="Music system is currently unavailable.",
+                color=0xff0000
+            )
+            await interaction.followup.send(embed=embed, ephemeral=True)
+
+    async def playlist_shuffle(self, interaction: discord.Interaction):
+        music_cog: "MusicCog" = self.bot.get_cog("MusicCog")
+        if music_cog:
+            await music_cog.inspire_me_playlist(interaction)
         else:
             embed = discord.Embed(
                 title="Error",

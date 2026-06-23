@@ -1,7 +1,8 @@
 import asyncio
+import re
 import requests
 from bs4 import BeautifulSoup
-from typing import Optional
+from typing import Optional, List
 from ytmusicapi import YTMusic
 
 def get_spotify_track_info(spotify_url):
@@ -84,3 +85,45 @@ def _search_ytmusic(url: str) -> Optional[str]:
 async def resolve_direct(url: str) -> Optional[str]:
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, _search_ytmusic, url)
+
+
+def get_spotify_playlist_tracks(url: str) -> Optional[List[str]]:
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    response = requests.get(url, headers=headers)
+    if response.status_code != 200:
+        return None
+    soup = BeautifulSoup(response.text, 'html.parser')
+    track_urls = []
+    seen = set()
+    track_pattern = re.compile(r'open\.spotify\.com/([a-z]{2,4}-[a-z]{2}/)?track/\w+', re.I)
+    for link in soup.find_all('a', href=True):
+        href = link['href']
+        match = track_pattern.search(href)
+        if match:
+            full_url = match.group(0)
+            if not full_url.startswith('http'):
+                full_url = 'https://' + full_url
+            if full_url not in seen:
+                seen.add(full_url)
+                track_urls.append(full_url)
+    # Also look for track data in script tags
+    for script in soup.find_all('script'):
+        if script.string and 'Spotify.Entity' in script.string:
+            for match in track_pattern.finditer(script.string):
+                full_url = match.group(0)
+                if not full_url.startswith('http'):
+                    full_url = 'https://' + full_url
+                if full_url not in seen:
+                    seen.add(full_url)
+                    track_urls.append(full_url)
+    return track_urls[:50] if track_urls else None
+
+
+async def resolve_playlist(url: str) -> Optional[List[dict]]:
+    loop = asyncio.get_event_loop()
+    track_urls = await loop.run_in_executor(None, get_spotify_playlist_tracks, url)
+    if not track_urls:
+        return None
+    tasks = [resolve(t) for t in track_urls]
+    results = await asyncio.gather(*tasks)
+    return [r for r in results if r] or None
