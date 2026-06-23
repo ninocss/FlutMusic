@@ -49,17 +49,15 @@ class Bot(commands.Bot):
         super().__init__(
             command_prefix="!",
             intents=intents,
-            activity=discord.Activity(name="/github • /play", type=discord.ActivityType.competing),
+            activity=discord.Activity(name="Alerta Alerta!", type=discord.ActivityType.listening),
             *args, **kwargs
         )
 
     async def setup_hook(self):
         # Add cogs
         cogs = [
-            GithubCog(self),
             MusicCog(self),
             RadioCog(self),
-            GuessNumberCog(self),
             UpdaterCog(self)
         ]
         

@@ -18,6 +18,11 @@ from util.resolver import (
 )
 from views.musicviews import ActionsView, LyricsButtonView, QueueView
 import json
+
+from util.playlist_db import (
+    create_playlist, delete_playlist, add_to_playlist,
+    import_playlist_tracks, get_playlist, get_user_playlists
+)
 import os
 from datetime import datetime, timedelta
 from ytmusicapi import YTMusic
@@ -157,6 +162,8 @@ class OptimizedQueue:
         self.queue.clear()
 
 class MusicCog(commands.Cog):
+    playlist_group = app_commands.Group(name="playlist", description="Manage personal playlists")
+
     def __init__(self, bot):
         self.bot = bot
         self.background_tasks = set()
@@ -1678,9 +1685,9 @@ class MusicCog(commands.Cog):
                     ),
                     ephemeral=True
                 )
-                return
-
-        random.shuffle(queue.queue)
+        queue_list = list(queue.queue)
+        random.shuffle(queue_list)
+        queue.queue = deque(queue_list)
 
         embed = self.make_embed(
             title="Queue shuffled",
@@ -2735,7 +2742,125 @@ class MusicCog(commands.Cog):
             )
         )
 
+
+    @playlist_group.command(name="create", description="Create a new playlist")
+    async def playlist_create(self, interaction: discord.Interaction, name: str):
+        await interaction.response.defer(ephemeral=True)
+        success = await create_playlist(interaction.user.id, name)
+        if success:
+            await interaction.followup.send(f"Playlist **{name}** created.")
+        else:
+            await interaction.followup.send(f"Playlist **{name}** already exists.")
+
+    @playlist_group.command(name="delete", description="Delete a playlist")
+    async def playlist_delete(self, interaction: discord.Interaction, name: str):
+        await interaction.response.defer(ephemeral=True)
+        success = await delete_playlist(interaction.user.id, name)
+        if success:
+            await interaction.followup.send(f"Playlist **{name}** deleted.")
+        else:
+            await interaction.followup.send(f"Playlist **{name}** not found.")
+
+    @playlist_group.command(name="add", description="Add a song to your playlist")
+    async def playlist_add(self, interaction: discord.Interaction, name: str, url: str):
+        await interaction.response.defer(ephemeral=True)
+        try:
+            info = await song_loader.extract_info_async(url)
+            song_data = info["entries"][0] if "entries" in info and info["entries"] else info
+            title = song_data.get("title", "Unknown")
+            success = await add_to_playlist(interaction.user.id, name, url, title)
+            if success:
+                await interaction.followup.send(f"Added **{title}** to playlist **{name}**.")
+            else:
+                await interaction.followup.send(f"Playlist **{name}** not found. Use `/playlist create` first.")
+        except Exception as e:
+            await interaction.followup.send(f"Failed to extract info from URL: {e}")
+
+    @playlist_group.command(name="import", description="Import a YouTube/Spotify playlist")
+    async def playlist_import(self, interaction: discord.Interaction, name: str, url: str):
+        await interaction.response.defer(ephemeral=True)
+        if await get_playlist(interaction.user.id, name) is None:
+            await interaction.followup.send(f"Playlist **{name}** not found. Create it first.")
+            return
+            
+        try:
+            tracks = []
+            if is_playlist(url):
+                resolved = await resolve_playlist(url)
+                if resolved:
+                    for t in resolved:
+                        tracks.append({"url": t["url"], "title": t.get("title", "Unknown")})
+            else:
+                info = await song_loader.extract_info_async(url)
+                if "entries" in info:
+                    for t in info["entries"]:
+                        if t and t.get("url"):
+                            tracks.append({"url": t["url"], "title": t.get("title", "Unknown")})
+                            
+            if not tracks:
+                await interaction.followup.send("No tracks found to import.")
+                return
+                
+            await import_playlist_tracks(interaction.user.id, name, tracks)
+            await interaction.followup.send(f"Imported {len(tracks)} tracks to playlist **{name}**.")
+        except Exception as e:
+            await interaction.followup.send(f"Failed to import playlist: {e}")
+
+    @playlist_group.command(name="list", description="List your playlists")
+    async def playlist_list(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        playlists = await get_user_playlists(interaction.user.id)
+        if not playlists:
+            await interaction.followup.send("You don't have any playlists.")
+        else:
+            msg = "**Your Playlists:**\n" + "\n".join(f"- {p}" for p in playlists)
+            await interaction.followup.send(msg)
+
+    @playlist_group.command(name="play", description="Play a saved playlist")
+    async def playlist_play(self, interaction: discord.Interaction, name: str):
+        await interaction.response.defer()
+        
+        voice_client = interaction.guild.voice_client
+        if not voice_client:
+            if interaction.user.voice:
+                await interaction.user.voice.channel.connect()
+                voice_client = interaction.guild.voice_client
+            else:
+                await interaction.followup.send("You are not in a voice channel.", ephemeral=True)
+                return
+
+        tracks = await get_playlist(interaction.user.id, name)
+        if tracks is None:
+            await interaction.followup.send(f"Playlist **{name}** not found.", ephemeral=True)
+            return
+        if not tracks:
+            await interaction.followup.send(f"Playlist **{name}** is empty.", ephemeral=True)
+            return
+
+        if interaction.guild.id not in guild_queues:
+            guild_queues[interaction.guild.id] = OptimizedQueue()
+
+        queue = guild_queues[interaction.guild.id]
+        added = 0
+        
+        for track in tracks:
+            try:
+                info = await song_loader.extract_info_async(track["url"])
+                song_data = info["entries"][0] if "entries" in info and info["entries"] else info
+                processed = await self.process_single_entry(song_data, requester=interaction.user)
+                if processed:
+                    queue.add(processed)
+                    added += 1
+            except Exception:
+                pass
+                
+        await interaction.followup.send(f"Added {added} songs from playlist **{name}** to the end of the queue.")
+        
+        if not voice_client.is_playing() and not voice_client.is_paused():
+            await self.play_next(interaction)
+
     async def cog_load(self):
+        self.bot.tree.add_command(self.playlist_group, guild=discord.Object(id=SYNC_SERVER))
         self.bot.tree.add_command(self.play, guild=discord.Object(id=SYNC_SERVER))
         self.bot.tree.add_command(self.skip, guild=discord.Object(id=SYNC_SERVER))
         self.bot.tree.add_command(self.list, guild=discord.Object(id=SYNC_SERVER))
