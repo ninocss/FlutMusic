@@ -6,9 +6,12 @@ from util.resolver import (
     is_playlist,
     resolve_to_search_query,
     resolve_to_direct_url,
+    resolve_playlist,
+    get_source_name,
     SOURCE_NAMES,
     RESOLVERS,
     DIRECT_RESOLVERS,
+    PLAYLIST_RESOLVERS,
 )
 
 
@@ -371,4 +374,252 @@ class TestDeezerScraper:
 
             from util.resolver.deezer import get_deezer_track_info
             result = get_deezer_track_info("https://deezer.com/track/12345678")
+            assert result is None
+
+
+# ── get_source_name ────────────────────────────────────────────
+
+class TestGetSourceName:
+    def test_spotify(self):
+        assert get_source_name("https://open.spotify.com/playlist/abc123") == "Spotify"
+
+    def test_deezer(self):
+        assert get_source_name("https://deezer.com/album/123456") == "Deezer"
+
+    def test_apple_music(self):
+        assert get_source_name("https://music.apple.com/de/album/test/123") == "Apple Music"
+
+    def test_tidal(self):
+        assert get_source_name("https://tidal.com/browse/playlist/abc123") == "Tidal"
+
+    def test_youtube_returns_none(self):
+        assert get_source_name("https://youtube.com/watch?v=test") is None
+
+    def test_unknown_returns_none(self):
+        assert get_source_name("https://example.com/song") is None
+
+    def test_case_insensitive(self):
+        assert get_source_name("HTTPS://OPEN.SPOTIFY.COM/TRACK/123") == "Spotify"
+
+
+# ── resolve_playlist ───────────────────────────────────────────
+
+class TestPlaylistResolversRegistration:
+    def test_playlist_resolvers_have_all_platforms(self):
+        assert "open.spotify.com" in PLAYLIST_RESOLVERS
+        assert "deezer.com" in PLAYLIST_RESOLVERS
+        assert "music.apple.com" in PLAYLIST_RESOLVERS
+        assert "tidal.com" in PLAYLIST_RESOLVERS
+
+    def test_source_names_in_sync(self):
+        for domain in PLAYLIST_RESOLVERS:
+            assert domain in SOURCE_NAMES
+
+
+class TestResolvePlaylist:
+    @pytest.mark.asyncio
+    async def test_unknown_domain_returns_none(self):
+        result = await resolve_playlist("https://example.com/song")
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_playlist_resolver_returns_list(self):
+        with patch("util.resolver.spotify.get_spotify_playlist_tracks") as mock_get:
+            mock_get.return_value = [
+                "https://open.spotify.com/track/abc123",
+                "https://open.spotify.com/track/def456",
+            ]
+
+            with patch("util.resolver.spotify.resolve") as mock_resolve:
+                mock_resolve.return_value = {
+                    "query": "ytsearch:test song",
+                    "title": "Test Song",
+                    "artist": "Test Artist",
+                    "source_name": "Spotify",
+                }
+
+                result = await resolve_playlist("https://open.spotify.com/playlist/abc123")
+                assert result is not None
+                assert len(result) == 2
+                assert result[0]["source_name"] == "Spotify"
+                assert result[0]["title"] == "Test Song"
+
+    @pytest.mark.asyncio
+    async def test_resolve_playlist_empty_tracks_returns_none(self):
+        with patch("util.resolver.spotify.get_spotify_playlist_tracks") as mock_get:
+            mock_get.return_value = None
+
+            result = await resolve_playlist("https://open.spotify.com/playlist/abc123")
+            assert result is None
+
+
+# ── Playlist scraping functions ────────────────────────────────
+
+class TestSpotifyPlaylistScraper:
+    SPOTIFY_PLAYLIST_HTML = """<html><body>
+    <a href="https://open.spotify.com/track/abc123">Track 1</a>
+    <a href="https://open.spotify.com/track/def456">Track 2</a>
+    <a href="https://open.spotify.com/track/ghi789">Track 3</a>
+    <a href="https://open.spotify.com/album/xyz999">Not a track</a>
+    </body></html>"""
+
+    def test_extracts_track_links(self):
+        from util.resolver.spotify import get_spotify_playlist_tracks
+        with patch("util.resolver.spotify.requests.get") as mock_get:
+            mock_response = MagicMock()
+            mock_response.status_code = 200
+            mock_response.text = self.SPOTIFY_PLAYLIST_HTML
+            mock_get.return_value = mock_response
+
+            result = get_spotify_playlist_tracks("https://open.spotify.com/playlist/abc123")
+            assert result is not None
+            assert len(result) == 3
+            assert "open.spotify.com/track/abc123" in result[0]
+            assert "open.spotify.com/track/def456" in result[1]
+            assert "open.spotify.com/track/ghi789" in result[2]
+
+    def test_non_200_returns_none(self):
+        from util.resolver.spotify import get_spotify_playlist_tracks
+        with patch("util.resolver.spotify.requests.get") as mock_get:
+            mock_response = MagicMock()
+            mock_response.status_code = 404
+            mock_get.return_value = mock_response
+
+            result = get_spotify_playlist_tracks("https://open.spotify.com/playlist/abc123")
+            assert result is None
+
+    def test_no_track_links_returns_none(self):
+        from util.resolver.spotify import get_spotify_playlist_tracks
+        with patch("util.resolver.spotify.requests.get") as mock_get:
+            mock_response = MagicMock()
+            mock_response.status_code = 200
+            mock_response.text = "<html><body>No tracks here</body></html>"
+            mock_get.return_value = mock_response
+
+            result = get_spotify_playlist_tracks("https://open.spotify.com/playlist/abc123")
+            assert result is None
+
+
+class TestDeezerPlaylistScraper:
+    DEEZER_PLAYLIST_HTML = """<html><body>
+    <a href="https://deezer.com/track/123">Track 1</a>
+    <a href="https://deezer.com/track/456">Track 2</a>
+    <a href="https://deezer.com/album/789">Not a track</a>
+    </body></html>"""
+
+    def test_extracts_track_links(self):
+        from util.resolver.deezer import get_deezer_playlist_tracks
+        with patch("util.resolver.deezer.requests.get") as mock_get:
+            mock_response = MagicMock()
+            mock_response.status_code = 200
+            mock_response.text = self.DEEZER_PLAYLIST_HTML
+            mock_get.return_value = mock_response
+
+            result = get_deezer_playlist_tracks("https://deezer.com/playlist/123")
+            assert result is not None
+            assert len(result) == 2
+            assert "deezer.com/track/123" in result[0]
+            assert "deezer.com/track/456" in result[1]
+
+    def test_non_200_returns_none(self):
+        from util.resolver.deezer import get_deezer_playlist_tracks
+        with patch("util.resolver.deezer.requests.get") as mock_get:
+            mock_response = MagicMock()
+            mock_response.status_code = 500
+            mock_get.return_value = mock_response
+
+            result = get_deezer_playlist_tracks("https://deezer.com/playlist/123")
+            assert result is None
+
+
+class TestTidalPlaylistScraper:
+    TIDAL_PLAYLIST_HTML = """<html><body>
+    <a href="https://tidal.com/browse/track/123">Track 1</a>
+    <a href="https://tidal.com/track/456">Track 2</a>
+    <a href="https://tidal.com/browse/album/789">Not a track</a>
+    </body></html>"""
+
+    def test_extracts_track_links(self):
+        from util.resolver.tidal import get_tidal_playlist_tracks
+        with patch("util.resolver.tidal.requests.get") as mock_get:
+            mock_response = MagicMock()
+            mock_response.status_code = 200
+            mock_response.text = self.TIDAL_PLAYLIST_HTML
+            mock_get.return_value = mock_response
+
+            result = get_tidal_playlist_tracks("https://tidal.com/browse/playlist/abc")
+            assert result is not None
+            assert len(result) == 2
+            assert "tidal.com/browse/track/123" in result[0]
+            assert "tidal.com/track/456" in result[1]
+
+    def test_non_200_returns_none(self):
+        from util.resolver.tidal import get_tidal_playlist_tracks
+        with patch("util.resolver.tidal.requests.get") as mock_get:
+            mock_response = MagicMock()
+            mock_response.status_code = 403
+            mock_get.return_value = mock_response
+
+            result = get_tidal_playlist_tracks("https://tidal.com/browse/playlist/abc")
+            assert result is None
+
+
+class TestAppleMusicPlaylistScraper:
+    APPLE_MUSIC_ALBUM_HTML = """<html><body>
+    <a href="https://music.apple.com/de/album/album-name/123456789?i=111">Track 1</a>
+    <a href="https://music.apple.com/de/album/album-name/123456789?i=222">Track 2</a>
+    <a href="https://music.apple.com/de/album/album-name/123456789?i=333">Track 3</a>
+    <a href="https://music.apple.com/de/artist/test/999">Not a track</a>
+    </body></html>"""
+
+    def test_extracts_tracks_from_links(self):
+        from util.resolver.apple_music import get_apple_music_playlist_info
+        with patch("util.resolver.apple_music.requests.get") as mock_get:
+            mock_response = MagicMock()
+            mock_response.status_code = 200
+            mock_response.text = self.APPLE_MUSIC_ALBUM_HTML
+            mock_get.return_value = mock_response
+
+            with patch("util.resolver.apple_music.get_apple_music_track_info") as mock_track:
+                mock_track.side_effect = [
+                    "Artist One - Song One",
+                    "Artist Two - Song Two",
+                    "Artist Three - Song Three",
+                ]
+
+                result = get_apple_music_playlist_info(
+                    "https://music.apple.com/de/album/album-name/123456789"
+                )
+                assert result is not None
+                assert len(result) == 3
+                assert result[0]["title"] == "Song One"
+                assert result[0]["artist"] == "Artist One"
+                assert result[1]["title"] == "Song Two"
+                assert result[1]["artist"] == "Artist Two"
+                assert result[2]["title"] == "Song Three"
+                assert result[2]["artist"] == "Artist Three"
+
+    def test_non_200_returns_none(self):
+        from util.resolver.apple_music import get_apple_music_playlist_info
+        with patch("util.resolver.apple_music.requests.get") as mock_get:
+            mock_response = MagicMock()
+            mock_response.status_code = 500
+            mock_get.return_value = mock_response
+
+            result = get_apple_music_playlist_info(
+                "https://music.apple.com/de/album/album-name/123456789"
+            )
+            assert result is None
+
+    def test_empty_page_returns_none(self):
+        from util.resolver.apple_music import get_apple_music_playlist_info
+        with patch("util.resolver.apple_music.requests.get") as mock_get:
+            mock_response = MagicMock()
+            mock_response.status_code = 200
+            mock_response.text = "<html><body>No content</body></html>"
+            mock_get.return_value = mock_response
+
+            result = get_apple_music_playlist_info(
+                "https://music.apple.com/de/album/album-name/123456789"
+            )
             assert result is None
