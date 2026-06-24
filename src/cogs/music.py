@@ -173,6 +173,8 @@ class MusicCog(commands.Cog):
 
     def __init__(self, bot):
         self.bot = bot
+        self.bot_start_time = discord.utils.utcnow()
+        self.songs_played = 0
         self.background_tasks = set()
         self.currently_playing = {}  # guild_id -> {song_data, started_at, elapsed, is_paused}
         self.guild_loops = {}  # guild_id -> 'off' | 'song' | 'queue'
@@ -436,6 +438,7 @@ class MusicCog(commands.Cog):
                 return
 
             queue.playing = True
+            self.songs_played += 1
 
             volume = guild_volumes.get(guild.id, 1.0)
             audio_source = discord.PCMVolumeTransformer(audio_source, volume=volume)
@@ -615,6 +618,7 @@ class MusicCog(commands.Cog):
                 return
 
             queue.playing = True
+            self.songs_played += 1
 
             volume = guild_volumes.get(guild.id, 1.0)
             audio_source = discord.PCMVolumeTransformer(audio_source, volume=volume)
@@ -2864,7 +2868,7 @@ class MusicCog(commands.Cog):
         await interaction.followup.send(f"Added {added} songs from playlist **{name}** to the end of the queue.")
         
         if not voice_client.is_playing() and not voice_client.is_paused():
-            await self.play_next(interaction)
+            await self.play_next(interaction.guild, voice_client, interaction)
 
     @dynamic_playlist_group.command(name="create", description="Create a dynamic playlist from a source URL")
     async def dynamic_playlist_create(self, interaction: discord.Interaction, name: str, url: str):
@@ -2941,6 +2945,34 @@ class MusicCog(commands.Cog):
         if not voice_client.is_playing() and not voice_client.is_paused():
             await self.play_next(interaction.guild, voice_client, interaction)
 
+    @app_commands.command(name="stats", description="Show bot statistics")
+    async def botstats(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+
+        uptime = discord.utils.utcnow() - self.bot_start_time
+        days, remainder = divmod(int(uptime.total_seconds()), 86400)
+        hours, remainder = divmod(remainder, 3600)
+        minutes, seconds = divmod(remainder, 60)
+
+        voice_connections = len(self.bot.voice_clients)
+        total_queued = sum(len(q.queue) for q in guild_queues.values() if hasattr(q, 'queue'))
+        guild_count = len(self.bot.guilds)
+        user_count = sum(g.member_count or 0 for g in self.bot.guilds)
+
+        embed = discord.Embed(
+            title="📊 Bot Statistics",
+            color=0x5865F2
+        )
+        embed.add_field(name="⏱ Uptime", value=f"{days}d {hours}h {minutes}m {seconds}s", inline=True)
+        embed.add_field(name="🎵 Songs Played", value=str(self.songs_played), inline=True)
+        embed.add_field(name="🌐 Servers", value=str(guild_count), inline=True)
+        embed.add_field(name="👥 Users", value=str(user_count), inline=True)
+        embed.add_field(name="🔊 Voice Connections", value=str(voice_connections), inline=True)
+        embed.add_field(name="📋 Queued Songs", value=str(total_queued), inline=True)
+        embed.add_field(name="📡 Latency", value=f"{self.bot.latency*1000:.0f}ms", inline=True)
+
+        await interaction.followup.send(embed=embed)
+
     async def cog_load(self):
         self.bot.tree.add_command(self.playlist_group, guild=discord.Object(id=SYNC_SERVER))
         self.bot.tree.add_command(self.dynamic_playlist_group, guild=discord.Object(id=SYNC_SERVER))
@@ -2960,6 +2992,7 @@ class MusicCog(commands.Cog):
         self.bot.tree.add_command(self.seek, guild=discord.Object(id=SYNC_SERVER))
         self.bot.tree.add_command(self.loop, guild=discord.Object(id=SYNC_SERVER))
         self.bot.tree.add_command(self.remove, guild=discord.Object(id=SYNC_SERVER))
+        self.bot.tree.add_command(self.botstats, guild=discord.Object(id=SYNC_SERVER))
 
     async def cog_unload(self):
         for task in self.background_tasks:
