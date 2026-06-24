@@ -23,8 +23,8 @@ async def get_spotify_track_info(spotify_url):
     
     if title_tag and description_tag:
         song_title = title_tag["content"]
-        # Die Description enthält oft "Song von [Künstler] · [Jahr]"
-        artist_info = description_tag["content"].split("·")[0].replace("Song von", "").strip()
+        artist_info = description_tag["content"].split("·")[0]
+        artist_info = re.sub(r'^(Song(\s+von)?)\s+', '', artist_info).strip()
         return f"{song_title} {artist_info}"
     
     # Fallback, falls die Meta-Tags fehlen (z.B. aus dem Seitentitel)

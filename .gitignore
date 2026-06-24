@@ -4,6 +4,7 @@ config/tickets.json
 channel.json
 .venv
 .vscode
-__pycache__/
+*__pycache__/
 timeouts.json
 src/cogs/minigames.py
+todo.md

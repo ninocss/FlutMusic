@@ -176,6 +176,7 @@ class MusicCog(commands.Cog):
         self.bot_start_time = discord.utils.utcnow()
         self.songs_played = 0
         self.background_tasks = set()
+        self._progress_tasks = {}
         self.currently_playing = {}  # guild_id -> {song_data, started_at, elapsed, is_paused}
         self.guild_loops = {}  # guild_id -> 'off' | 'song' | 'queue'
 
@@ -222,7 +223,7 @@ class MusicCog(commands.Cog):
                 
             channel = await self.bot.fetch_channel(I_CHANNEL)
             if channel:
-                await purge_channel(ctx.channel)
+                await purge_channel(channel)
                 await self.send_static_message()
         except Exception as e:
             logger.error(f"Error during delayed cleanup: {e}")
@@ -325,19 +326,11 @@ class MusicCog(commands.Cog):
                     self.bot.loop
                 )
             else:
-                # Retry succeeded, now handle loop / next song normally
                 loop_mode = self.guild_loops.get(guild.id, 'off')
-                if loop_mode == 'song' and song_data:
-                    queue.queue.appendleft(song_data)
-                elif loop_mode == 'queue' and song_data:
-                    if not hasattr(queue, '_loop_played'):
-                        queue._loop_played = []
-                    queue._loop_played.append(song_data)
-                    if queue.is_empty() and queue._loop_played:
-                        for s in queue._loop_played:
-                            queue.add(s)
-                        queue._loop_played.clear()
-                queue.playing = False
+                asyncio.run_coroutine_threadsafe(
+                    self._handle_song_end(guild, queue, song_data, loop_mode),
+                    self.bot.loop
+                )
                 asyncio.run_coroutine_threadsafe(
                     self.play_next(guild, voice_client, interaction),
                     self.bot.loop
@@ -351,6 +344,20 @@ class MusicCog(commands.Cog):
             logger.error(f"Retry {retry_count + 1} play error: {e}")
             queue.playing = False
             await self._retry_failed_song(guild, voice_client, interaction, song_data, retry_count + 1)
+
+    async def _handle_song_end(self, guild, queue, song_data, loop_mode):
+        async with queue.lock:
+            if loop_mode == 'song' and song_data:
+                queue.queue.appendleft(song_data)
+            elif loop_mode == 'queue' and song_data:
+                if not hasattr(queue, '_loop_played'):
+                    queue._loop_played = []
+                queue._loop_played.append(song_data)
+                if queue.is_empty() and queue._loop_played:
+                    for s in queue._loop_played:
+                        queue.add(s)
+                    queue._loop_played.clear()
+            queue.playing = False
 
     async def play_next(self, guild, voice_client, interaction):
         if guild.id not in guild_queues:
@@ -376,19 +383,11 @@ class MusicCog(commands.Cog):
                         self.bot.loop
                     )
                     return
-            # Handle song loop
             loop_mode = self.guild_loops.get(guild.id, 'off')
-            if loop_mode == 'song' and next_song_data:
-                queue.queue.appendleft(next_song_data)
-            elif loop_mode == 'queue' and next_song_data:
-                if not hasattr(queue, '_loop_played'):
-                    queue._loop_played = []
-                queue._loop_played.append(next_song_data)
-                if queue.is_empty() and queue._loop_played:
-                    for s in queue._loop_played:
-                        queue.add(s)
-                    queue._loop_played.clear()
-            queue.playing = False
+            asyncio.run_coroutine_threadsafe(
+                self._handle_song_end(guild, queue, next_song_data, loop_mode),
+                self.bot.loop
+            )
             pn = self.play_next(guild, voice_client, interaction)
             asyncio.run_coroutine_threadsafe(pn, self.bot.loop)
 
@@ -488,9 +487,7 @@ class MusicCog(commands.Cog):
             try:
                 lyrics_view = LyricsButtonView(self, next_song_data['title'], next_song_data['author'])
                 msg = await interaction.channel.send(embed=embed, view=lyrics_view)
-                self.create_background_task(
-                    self.update_progress(msg, embed, next_song_data['duration'])
-                )
+                self._schedule_progress(guild.id, msg, embed, next_song_data['duration'])
             except Exception as e:
                 logger.error(f"Error sending now playing message: {e}")
 
@@ -666,9 +663,7 @@ class MusicCog(commands.Cog):
                 try:
                     lyrics_view = LyricsButtonView(self, processed['title'], processed['author'])
                     msg = await interaction.channel.send(embed=embed, view=lyrics_view)
-                    self.create_background_task(
-                        self.update_progress(msg, embed, processed['duration'])
-                    )
+                    self._schedule_progress(guild.id, msg, embed, processed['duration'])
                 except Exception as e:
                     logger.error(f"Error sending now playing message: {e}")
 
@@ -847,6 +842,13 @@ class MusicCog(commands.Cog):
             await message.edit(embed=embed)
         except (discord.HTTPException, asyncio.CancelledError):
             pass
+
+    def _schedule_progress(self, guild_id, msg, embed, duration):
+        old = self._progress_tasks.get(guild_id)
+        if old and not old.done():
+            old.cancel()
+        task = self.create_background_task(self.update_progress(msg, embed, duration))
+        self._progress_tasks[guild_id] = task
 
     def format_time(self, seconds):
         m, s = divmod(int(seconds), 60)
@@ -1824,7 +1826,7 @@ class MusicCog(commands.Cog):
                 del guild_queues[guild_id]
             self.currently_playing.pop(guild_id, None)
             
-            self.bot.loop.create_task(self._delayed_cleanup_task(guild_id))
+            self.create_background_task(self._delayed_cleanup_task(guild_id))
             return
 
         # Handle users leaving voice channel (auto-disconnect when empty)
@@ -2702,10 +2704,19 @@ class MusicCog(commands.Cog):
             def after_song(e):
                 if e:
                     logger.error(f"Playback error: {e}")
-                loop_mode = self.guild_loops.get(interaction.guild.id, 'off')
-                if loop_mode == 'song' and song_data:
-                    queue.queue.appendleft(song_data)
-                queue.playing = False
+                if queue:
+                    loop_mode = self.guild_loops.get(interaction.guild.id, 'off')
+                    if loop_mode == 'song' and song_data:
+                        queue.queue.appendleft(song_data)
+                    elif loop_mode == 'queue' and song_data:
+                        if not hasattr(queue, '_loop_played'):
+                            queue._loop_played = []
+                        queue._loop_played.append(song_data)
+                        if queue.is_empty() and queue._loop_played:
+                            for s in queue._loop_played:
+                                queue.add(s)
+                            queue._loop_played.clear()
+                    queue.playing = False
                 pn = self.play_next(interaction.guild, voice_client, interaction)
                 asyncio.run_coroutine_threadsafe(pn, self.bot.loop)
 
@@ -2844,6 +2855,10 @@ class MusicCog(commands.Cog):
     async def playlist_add(self, interaction: discord.Interaction, name: str, url: str):
         await interaction.response.defer(ephemeral=True)
         try:
+            if needs_resolution(url):
+                direct = await resolve_to_direct_url(url)
+                if direct:
+                    url = direct
             info = await song_loader.extract_info_async(url)
             song_data = info["entries"][0] if "entries" in info and info["entries"] else info
             title = song_data.get("title", "Unknown")
@@ -2907,6 +2922,9 @@ class MusicCog(commands.Cog):
             else:
                 await interaction.followup.send("You are not in a voice channel.", ephemeral=True)
                 return
+        elif not interaction.user.voice or interaction.user.voice.channel != voice_client.channel:
+            await interaction.followup.send("You must be in the same voice channel as the bot.", ephemeral=True)
+            return
 
         tracks = await get_playlist(interaction.user.id, name)
         if tracks is None:
@@ -2924,7 +2942,12 @@ class MusicCog(commands.Cog):
         
         for track in tracks:
             try:
-                info = await song_loader.extract_info_async(track["url"])
+                track_url = track["url"]
+                if needs_resolution(track_url):
+                    direct = await resolve_to_direct_url(track_url)
+                    if direct:
+                        track_url = direct
+                info = await song_loader.extract_info_async(track_url)
                 song_data = info["entries"][0] if "entries" in info and info["entries"] else info
                 processed = await self.process_single_entry(song_data, requester=interaction.user)
                 if processed:
@@ -2977,6 +3000,9 @@ class MusicCog(commands.Cog):
             else:
                 await interaction.followup.send("You are not in a voice channel.", ephemeral=True)
                 return
+        elif not interaction.user.voice or interaction.user.voice.channel != voice_client.channel:
+            await interaction.followup.send("You must be in the same voice channel as the bot.", ephemeral=True)
+            return
 
         info = await get_dynamic_playlist(interaction.user.id, name)
         if info is None:

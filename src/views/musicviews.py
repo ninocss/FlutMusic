@@ -418,7 +418,7 @@ class LyricsButtonView(View):
                 color=0xe74c3c
             )
             try:
-                await interaction.edit_original_response(embed=not_found)
+                await interaction.followup.send(embed=not_found, ephemeral=True)
             except Exception:
                 pass
             return
@@ -426,9 +426,9 @@ class LyricsButtonView(View):
         view = LyricsView(lyrics_data)
         embed = view.create_page_embed(0)
         try:
-            await interaction.edit_original_response(embed=embed, view=view)
+            await interaction.followup.send(embed=embed, view=view)
         except Exception:
-            await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+            pass
 
 
 class QueueView(View):
