@@ -722,7 +722,7 @@ class MusicCog(commands.Cog):
             await self.bot.change_presence(
                 activity=discord.Activity(
                     name=f"{title} - {author}",
-                    type=discord.ActivityType.playing
+                    type=discord.ActivityType.listening
                 )
             )
         except Exception:
