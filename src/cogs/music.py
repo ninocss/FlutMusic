@@ -23,6 +23,12 @@ from util.playlist_db import (
     create_playlist, delete_playlist, add_to_playlist,
     import_playlist_tracks, get_playlist, get_user_playlists
 )
+from util.dynamic_playlist_db import (
+    create_dynamic_playlist, delete_dynamic_playlist,
+    get_dynamic_playlist, get_user_dynamic_playlists,
+    fetch_dynamic_tracks
+)
+from util.cleaner import purge_channel
 import os
 from datetime import datetime, timedelta
 from ytmusicapi import YTMusic
@@ -163,6 +169,7 @@ class OptimizedQueue:
 
 class MusicCog(commands.Cog):
     playlist_group = app_commands.Group(name="playlist", description="Manage personal playlists")
+    dynamic_playlist_group = app_commands.Group(name="dynamic-playlist", description="Manage dynamic playlists (live-fetched from source)")
 
     def __init__(self, bot):
         self.bot = bot
@@ -213,8 +220,7 @@ class MusicCog(commands.Cog):
                 
             channel = await self.bot.fetch_channel(I_CHANNEL)
             if channel:
-                await channel.send("s!purge 1d")
-                await asyncio.sleep(5)
+                await purge_channel(ctx.channel)
                 await self.send_static_message()
         except Exception as e:
             logger.error(f"Error during delayed cleanup: {e}")
@@ -2860,8 +2866,84 @@ class MusicCog(commands.Cog):
         if not voice_client.is_playing() and not voice_client.is_paused():
             await self.play_next(interaction)
 
+    @dynamic_playlist_group.command(name="create", description="Create a dynamic playlist from a source URL")
+    async def dynamic_playlist_create(self, interaction: discord.Interaction, name: str, url: str):
+        await interaction.response.defer(ephemeral=True)
+        success, msg = await create_dynamic_playlist(interaction.user.id, name, url)
+        await interaction.followup.send(msg)
+
+    @dynamic_playlist_group.command(name="delete", description="Delete a dynamic playlist")
+    async def dynamic_playlist_delete(self, interaction: discord.Interaction, name: str):
+        await interaction.response.defer(ephemeral=True)
+        success = await delete_dynamic_playlist(interaction.user.id, name)
+        if success:
+            await interaction.followup.send(f"Dynamic playlist **{name}** deleted.")
+        else:
+            await interaction.followup.send(f"Dynamic playlist **{name}** not found.")
+
+    @dynamic_playlist_group.command(name="list", description="List your dynamic playlists")
+    async def dynamic_playlist_list(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        playlists = await get_user_dynamic_playlists(interaction.user.id)
+        if not playlists:
+            await interaction.followup.send("You don't have any dynamic playlists.")
+        else:
+            lines = []
+            for p in playlists:
+                lines.append(f"**{p['name']}** — {p['source_type']}")
+            await interaction.followup.send("**Your Dynamic Playlists:**\n" + "\n".join(lines))
+
+    @dynamic_playlist_group.command(name="play", description="Play a dynamic playlist (fetches tracks live)")
+    async def dynamic_playlist_play(self, interaction: discord.Interaction, name: str):
+        await interaction.response.defer()
+
+        voice_client = interaction.guild.voice_client
+        if not voice_client:
+            if interaction.user.voice:
+                await interaction.user.voice.channel.connect()
+                voice_client = interaction.guild.voice_client
+            else:
+                await interaction.followup.send("You are not in a voice channel.", ephemeral=True)
+                return
+
+        info = await get_dynamic_playlist(interaction.user.id, name)
+        if info is None:
+            await interaction.followup.send(f"Dynamic playlist **{name}** not found.", ephemeral=True)
+            return
+
+        await interaction.followup.send(f"Fetching tracks from **{info['source_type']}**...")
+        tracks = await fetch_dynamic_tracks(info["source_url"], info["source_type"])
+
+        if not tracks:
+            await interaction.followup.send("No tracks found in the source playlist.")
+            return
+
+        if interaction.guild.id not in guild_queues:
+            guild_queues[interaction.guild.id] = OptimizedQueue()
+
+        queue = guild_queues[interaction.guild.id]
+        added = 0
+
+        for track in tracks:
+            try:
+                info = await song_loader.extract_info_async(track["url"])
+                song_data = info["entries"][0] if "entries" in info and info["entries"] else info
+                processed = await self.process_single_entry(song_data, requester=interaction.user)
+                if processed:
+                    queue.add(processed)
+                    added += 1
+            except Exception:
+                pass
+
+        if added > 0:
+            await interaction.followup.send(f"Added {added} songs from dynamic playlist **{name}** to the queue.")
+
+        if not voice_client.is_playing() and not voice_client.is_paused():
+            await self.play_next(interaction.guild, voice_client, interaction)
+
     async def cog_load(self):
         self.bot.tree.add_command(self.playlist_group, guild=discord.Object(id=SYNC_SERVER))
+        self.bot.tree.add_command(self.dynamic_playlist_group, guild=discord.Object(id=SYNC_SERVER))
         self.bot.tree.add_command(self.play, guild=discord.Object(id=SYNC_SERVER))
         self.bot.tree.add_command(self.skip, guild=discord.Object(id=SYNC_SERVER))
         self.bot.tree.add_command(self.list, guild=discord.Object(id=SYNC_SERVER))

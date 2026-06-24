@@ -56,7 +56,6 @@ class Bot(commands.Bot):
         cogs = [
             MusicCog(self),
             RadioCog(self),
-            UpdaterCog(self)
         ]
         
         for cog in cogs:
