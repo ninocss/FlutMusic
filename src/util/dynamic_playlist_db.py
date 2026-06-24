@@ -13,7 +13,7 @@ DYNAMIC_FILE = "dynamic_playlists.json"
 lock = asyncio.Lock()
 
 YOUTUBE_PLAYLIST_RE = re.compile(
-    r'(youtube\.com|youtu\.be)/(playlist\?list=|watch\?.*list=)', re.I
+    r'(youtube\.com/(playlist\?list=|watch\?.*list=)|youtu\.be/.*[\?&]list=)', re.I
 )
 
 async def _load() -> Dict:

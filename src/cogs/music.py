@@ -2926,8 +2926,8 @@ class MusicCog(commands.Cog):
 
         for track in tracks:
             try:
-                info = await song_loader.extract_info_async(track["url"])
-                song_data = info["entries"][0] if "entries" in info and info["entries"] else info
+                extracted = await song_loader.extract_info_async(track["url"])
+                song_data = extracted["entries"][0] if "entries" in extracted and extracted["entries"] else extracted
                 processed = await self.process_single_entry(song_data, requester=interaction.user)
                 if processed:
                     queue.add(processed)
