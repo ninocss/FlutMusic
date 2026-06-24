@@ -2079,7 +2079,75 @@ class MusicCog(commands.Cog):
         )
 
         await interaction.response.send_message(embed=embed)
-    
+
+    @app_commands.command(name="musicmutelist", description="List all currently muted users")
+    async def musicmute_list(self, interaction: discord.Interaction):
+        if not interaction.user.guild_permissions.kick_members:
+            await interaction.response.send_message(
+                embed=self.make_embed(
+                    title="No permission",
+                    description="You need `Kick Members` permission to view muted users.",
+                    color=0xe74c3c
+                ),
+                ephemeral=True
+            )
+            return
+
+        self.cleanup_expired_timeouts()
+        timeout_file = "timeouts.json"
+
+        if not os.path.exists(timeout_file):
+            await interaction.response.send_message(
+                embed=self.make_embed(
+                    title="No mutes",
+                    description="There are no currently muted users.",
+                    color=0x5865F2
+                ),
+                ephemeral=True
+            )
+            return
+
+        try:
+            with open(timeout_file, 'r') as f:
+                all_timeouts = json.load(f)
+        except (json.JSONDecodeError, FileNotFoundError):
+            all_timeouts = {}
+
+        guild_mutes = [
+            data for data in all_timeouts.values()
+            if data.get("guild_id") == interaction.guild.id
+        ]
+
+        if not guild_mutes:
+            await interaction.response.send_message(
+                embed=self.make_embed(
+                    title="No mutes",
+                    description="There are no currently muted users in this server.",
+                    color=0x5865F2
+                ),
+                ephemeral=True
+            )
+            return
+
+        now = datetime.now()
+        lines = []
+        for data in guild_mutes:
+            end = datetime.fromisoformat(data["end_time"])
+            remaining = max(0, int((end - now).total_seconds() / 60))
+            name = data.get("username", "Unknown")
+            lines.append(
+                f"**{name}** — {remaining}m remaining"
+            )
+
+        embed = self.make_embed(
+            title=f"Muted users in {interaction.guild.name}",
+            description="\n".join(lines),
+            color=0xe74c3c,
+            footer=f"Total: {len(guild_mutes)} muted"
+        )
+
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
     @app_commands.command(name="clearqueue", description="Vote to clear the entire queue")
     async def clear_queue(self, interaction: discord.Interaction):
         if await self.check_timeout_decorator(interaction):
@@ -2993,6 +3061,7 @@ class MusicCog(commands.Cog):
         self.bot.tree.add_command(self.loop, guild=discord.Object(id=SYNC_SERVER))
         self.bot.tree.add_command(self.remove, guild=discord.Object(id=SYNC_SERVER))
         self.bot.tree.add_command(self.botstats, guild=discord.Object(id=SYNC_SERVER))
+        self.bot.tree.add_command(self.musicmute_list, guild=discord.Object(id=SYNC_SERVER))
 
     async def cog_unload(self):
         for task in self.background_tasks:
