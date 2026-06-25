@@ -21,7 +21,7 @@ import json
 
 from util.playlist_db import (
     create_playlist, delete_playlist, add_to_playlist,
-    import_playlist_tracks, get_playlist, get_user_playlists
+    import_playlist_tracks, get_playlist, get_guild_playlists
 )
 import os
 from datetime import datetime, timedelta
@@ -108,6 +108,97 @@ def safe_avatar(user: discord.abc.User) -> Optional[str]:
         return user.display_avatar.url
     except Exception:
         return None
+
+async def purge_channel(channel: discord.TextChannel, limit: Optional[int] = None, check=None):
+    """Delete all messages in a channel
+    Args:
+        channel: The Discord text channel to purge
+        limit: Maximum number of messages to delete (None for unlimited)
+        check: Optional function to filter messages (msg -> bool)
+    
+    Returns:
+        int: Number of messages deleted
+    """
+    deleted_count = 0
+    
+    try:
+        messages = []
+        async for msg in channel.history(limit=limit):
+            if not check or check(msg):
+                messages.append(msg)
+        
+        if not messages:
+            return 0
+        
+        recent_messages = [msg for msg in messages if msg.age.days < 14]
+        old_messages = [msg for msg in messages if msg.age.days >= 14]
+        
+        while recent_messages:
+            batch = recent_messages[:100]
+            recent_messages = recent_messages[100:]
+            
+            try:
+                if len(batch) >= 2:
+                    await channel.delete_messages(batch)
+                    deleted_count += len(batch)
+                    logger.info(f"Bulk deleted {len(batch)} messages")
+                elif len(batch) == 1:
+                    await batch[0].delete()
+                    deleted_count += 1
+                
+                if recent_messages:
+                    await asyncio.sleep(2)
+                    
+            except discord.HTTPException as e:
+                if e.status == 429:
+                    retry_after = float(e.response.headers.get('Retry-After', 2))
+                    logger.warning(f"Rate limited on bulk delete, waiting {retry_after:.1f}s")
+                    await asyncio.sleep(retry_after)
+                    recent_messages = batch + recent_messages
+                else:
+                    logger.error(f"Bulk delete failed: {e}")
+                    for msg in batch:
+                        try:
+                            await msg.delete()
+                            deleted_count += 1
+                            await asyncio.sleep(1)
+                        except Exception:
+                            pass
+        
+        for msg in old_messages:
+            try:
+                await msg.delete()
+                deleted_count += 1
+                
+                if deleted_count % 5 == 0:
+                    await asyncio.sleep(5)
+                else:
+                    await asyncio.sleep(1)
+                    
+            except discord.Forbidden:
+                logger.error("Missing permissions to delete messages")
+                return deleted_count
+            except discord.HTTPException as e:
+                if e.status == 429:
+                    retry_after = float(e.response.headers.get('Retry-After', 5))
+                    logger.warning(f"Rate limited, waiting {retry_after:.1f}s")
+                    await asyncio.sleep(retry_after)
+                    try:
+                        await msg.delete()
+                        deleted_count += 1
+                    except Exception:
+                        pass
+                else:
+                    logger.error(f"Failed to delete message: {e}")
+        
+        logger.info(f"Purge complete: {deleted_count} messages deleted from #{channel.name}")
+        
+    except discord.Forbidden:
+        logger.error(f"Bot doesn't have permission to read/delete messages in #{channel.name}")
+    except Exception as e:
+        logger.error(f"Error during channel purge: {e}")
+    
+    return deleted_count
 
 class AsyncSongLoader:
     def __init__(self, max_workers=4):
@@ -206,32 +297,33 @@ class MusicCog(commands.Cog):
         try:
             await asyncio.sleep(120)
             
-            # Check if bot has rejoined the voice channel
             guild = self.bot.get_guild(guild_id)
             if guild and guild.voice_client and guild.voice_client.is_connected():
                 return
                 
             channel = await self.bot.fetch_channel(I_CHANNEL)
             if channel:
-                await channel.send("s!purge 1d")
-                await asyncio.sleep(5)
-                await self.send_static_message()
+                await purge_channel(channel)
         except Exception as e:
             logger.error(f"Error during delayed cleanup: {e}")
 
     async def send_static_message(self):
         try:
             actions_embed = self.make_embed(
-                title="Music Controls",
-                description="Here are all available commands:",
+                title="Marcante Musik",
+                description=(
+                    "**/play <URL | search term>**\n"
+                    "Play a song from YouTube, Spotify, SoundCloud, or other supported platforms.\n\n"
+                    "**/queue**\n"
+                    "View the current song queue.\n\n"
+                    "**/skip**\n"
+                    "Skip the currently playing song.\n\n" 
+                ),
                 color=0x5865F2,
                 thumbnail=safe_avatar(self.bot.user),
                 footer_icon=safe_avatar(self.bot.user),
-                fields=[
-                    ("🎧 Playback", "`/play` `/pause` `/stop` `/skip` `/volume` `/playing` `/seek` `/loop` `/radio`", False),
-                    ("📋 Queue", "`/queue` `/shuffle` `/clearqueue` `/move` `/remove` `/chart`", False),
-                    ("🎵 Playlists", "`/playlist create` `/playlist add` `/playlist list` `/playlist play` `/playlist import` `/playlist delete`", False),
-                ]
+                footer="Join a voice channel and start listening!",
+                fields=[]
             )
 
             channel = await self.bot.fetch_channel(I_CHANNEL)
@@ -242,6 +334,13 @@ class MusicCog(commands.Cog):
                         message.embeds and
                         message.embeds[0].title and
                         "Music Controls" in message.embeds[0].title
+                    ):
+                        await message.delete()
+                    if (
+                        message.author == self.bot.user and
+                        message.embeds and
+                        message.embeds[0].title and
+                        "Music Bot" in message.embeds[0].title
                     ):
                         await message.delete()
 
@@ -2747,29 +2846,36 @@ class MusicCog(commands.Cog):
     @playlist_group.command(name="create", description="Create a new playlist")
     async def playlist_create(self, interaction: discord.Interaction, name: str):
         await interaction.response.defer(ephemeral=True)
-        success = await create_playlist(interaction.user.id, name)
+        success = await create_playlist(interaction.guild.id, name)
         if success:
-            await interaction.followup.send(f"Playlist **{name}** created.")
+            await interaction.followup.send(f"Playlist **{name}** created for this server.")
         else:
             await interaction.followup.send(f"Playlist **{name}** already exists.")
 
     @playlist_group.command(name="delete", description="Delete a playlist")
     async def playlist_delete(self, interaction: discord.Interaction, name: str):
         await interaction.response.defer(ephemeral=True)
-        success = await delete_playlist(interaction.user.id, name)
+        success = await delete_playlist(interaction.guild.id, name)
         if success:
             await interaction.followup.send(f"Playlist **{name}** deleted.")
         else:
             await interaction.followup.send(f"Playlist **{name}** not found.")
 
-    @playlist_group.command(name="add", description="Add a song to your playlist")
+    @playlist_group.command(name="add", description="Add a song to the server playlist")
     async def playlist_add(self, interaction: discord.Interaction, name: str, url: str):
         await interaction.response.defer(ephemeral=True)
         try:
             info = await song_loader.extract_info_async(url)
+            if not info:
+                await interaction.followup.send(f"Could not extract info from URL: **{url}**")
+                return
             song_data = info["entries"][0] if "entries" in info and info["entries"] else info
+            if not song_data:
+                await interaction.followup.send(f"Could not extract song data from URL: **{url}**")
+                return
             title = song_data.get("title", "Unknown")
-            success = await add_to_playlist(interaction.user.id, name, url, title)
+            song_url = song_data.get("url", url)
+            success = await add_to_playlist(interaction.guild.id, name, song_url, title)
             if success:
                 await interaction.followup.send(f"Added **{title}** to playlist **{name}**.")
             else:
@@ -2780,57 +2886,149 @@ class MusicCog(commands.Cog):
     @playlist_group.command(name="import", description="Import a YouTube/Spotify playlist")
     async def playlist_import(self, interaction: discord.Interaction, name: str, url: str):
         await interaction.response.defer(ephemeral=True)
-        if await get_playlist(interaction.user.id, name) is None:
+        if await get_playlist(interaction.guild.id, name) is None:
             await interaction.followup.send(f"Playlist **{name}** not found. Create it first.")
             return
             
         try:
             tracks = []
+            
+            # Step 1: Resolving tracks
             if is_playlist(url):
                 resolved = await resolve_playlist(url)
-                if resolved:
-                    for t in resolved:
-                        tracks.append({"url": t["url"], "title": t.get("title", "Unknown")})
+                if not resolved:
+                    await interaction.followup.send("Could not resolve playlist. Make sure the URL is valid.")
+                    return
+                    
+                loading_msg = await interaction.followup.send(
+                    embed=self.make_embed(
+                        title="🔍 Resolving Tracks",
+                        description=f"Found **{len(resolved)}** tracks\nConverting to playable URLs...",
+                        color=0x3498db
+                    )
+                )
+                
+                failed_count = 0
+                total = len(resolved)
+                
+                for i, t in enumerate(resolved):
+                    try:
+                        # Resolvers return "query" key (ytsearch:...), need to resolve to actual URL
+                        query_url = t.get("query", t.get("url", ""))
+                        if query_url.startswith("ytsearch:"):
+                            # Extract the search query and resolve to actual YouTube URL
+                            search_info = await song_loader.extract_info_async(query_url)
+                            if search_info:
+                                # Get the first result's actual URL
+                                if "entries" in search_info and search_info["entries"]:
+                                    actual_url = search_info["entries"][0].get("url", "")
+                                else:
+                                    actual_url = search_info.get("url", "")
+                                
+                                if actual_url:
+                                    tracks.append({"url": actual_url, "title": t.get("title", "Unknown")})
+                                else:
+                                    failed_count += 1
+                            else:
+                                failed_count += 1
+                        else:
+                            # Already a URL
+                            if query_url:
+                                tracks.append({"url": query_url, "title": t.get("title", "Unknown")})
+                            else:
+                                failed_count += 1
+                    except Exception as e:
+                        logger.error(f"Failed to resolve track {i+1}: {e}")
+                        failed_count += 1
+                    
+                    # Update progress every 3 tracks
+                    if (i + 1) % 3 == 0 or (i + 1) == total:
+                        try:
+                            await loading_msg.edit(
+                                embed=self.make_embed(
+                                    title="🔍 Resolving Tracks",
+                                    description=f"Resolving **{name}**...\nProcessed {i + 1}/{total} tracks",
+                                    color=0x3498db,
+                                    fields=[
+                                        ("Resolved", f"```\n{i + 1 - failed_count}\n```", True),
+                                        ("Failed", f"```\n{failed_count}\n```", True),
+                                    ]
+                                )
+                            )
+                        except:
+                            pass
             else:
+                # Single URL or non-playlist
+                loading_msg = await interaction.followup.send(
+                    embed=self.make_embed(
+                        title="📥 Importing",
+                        description="Fetching tracks...",
+                        color=0x3498db
+                    )
+                )
+                
                 info = await song_loader.extract_info_async(url)
-                if "entries" in info:
+                if info and "entries" in info:
                     for t in info["entries"]:
                         if t and t.get("url"):
                             tracks.append({"url": t["url"], "title": t.get("title", "Unknown")})
-                            
+            
+            # Step 2: Save to database
             if not tracks:
-                await interaction.followup.send("No tracks found to import.")
+                await loading_msg.edit(
+                    embed=self.make_embed(
+                        title="❌ Import Failed",
+                        description="No tracks found to import.",
+                        color=0xe74c3c
+                    )
+                )
                 return
-                
-            await import_playlist_tracks(interaction.user.id, name, tracks)
-            await interaction.followup.send(f"Imported {len(tracks)} tracks to playlist **{name}**.")
+            
+            await import_playlist_tracks(interaction.guild.id, name, tracks)
+            
+            # Step 3: Final summary
+            success_count = len(tracks)
+            await loading_msg.edit(
+                embed=self.make_embed(
+                    title="✅ Import Complete",
+                    description=f"Successfully imported **{success_count}** track{'s' if success_count != 1 else ''} to **{name}**.",
+                    color=0x2ecc71,
+                    fields=[
+                        ("Playlist", f"```\n{name}\n```", True),
+                        ("Tracks", f"```\n{success_count}\n```", True),
+                    ]
+                )
+            )
+            
         except Exception as e:
+            logger.error(f"Playlist import failed: {e}")
             await interaction.followup.send(f"Failed to import playlist: {e}")
 
-    @playlist_group.command(name="list", description="List your playlists")
+    @playlist_group.command(name="list", description="List server playlists")
     async def playlist_list(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
-        playlists = await get_user_playlists(interaction.user.id)
+        playlists = await get_guild_playlists(interaction.guild.id)
         if not playlists:
-            await interaction.followup.send("You don't have any playlists.")
+            await interaction.followup.send("This server doesn't have any playlists.")
         else:
-            msg = "**Your Playlists:**\n" + "\n".join(f"- {p}" for p in playlists)
+            msg = "**Server Playlists:**\n" + "\n".join(f"- {p}" for p in playlists)
             await interaction.followup.send(msg)
 
     @playlist_group.command(name="play", description="Play a saved playlist")
     async def playlist_play(self, interaction: discord.Interaction, name: str):
         await interaction.response.defer()
         
-        voice_client = interaction.guild.voice_client
-        if not voice_client:
-            if interaction.user.voice:
-                await interaction.user.voice.channel.connect()
-                voice_client = interaction.guild.voice_client
-            else:
-                await interaction.followup.send("You are not in a voice channel.", ephemeral=True)
-                return
+        if interaction.guild.id not in guild_queues:
+            guild_queues[interaction.guild.id] = OptimizedQueue()
 
-        tracks = await get_playlist(interaction.user.id, name)
+        queue = guild_queues[interaction.guild.id]
+        
+        voice_client = await self._ensure_voice(interaction, queue)
+        if not voice_client:
+            await interaction.followup.send("You need to be in a voice channel first.", ephemeral=True)
+            return
+
+        tracks = await get_playlist(interaction.guild.id, name)
         if tracks is None:
             await interaction.followup.send(f"Playlist **{name}** not found.", ephemeral=True)
             return
@@ -2838,27 +3036,91 @@ class MusicCog(commands.Cog):
             await interaction.followup.send(f"Playlist **{name}** is empty.", ephemeral=True)
             return
 
-        if interaction.guild.id not in guild_queues:
-            guild_queues[interaction.guild.id] = OptimizedQueue()
+        # Show loading message with progress
+        loading_msg = await interaction.followup.send(
+            embed=self.make_embed(
+                title="📂 Loading Playlist",
+                description=f"Loading **{name}**...\nPreparing {len(tracks)} tracks...",
+                color=0x3498db
+            )
+        )
 
-        queue = guild_queues[interaction.guild.id]
         added = 0
+        failed = 0
+        total = len(tracks)
         
-        for track in tracks:
+        for i, track in enumerate(tracks):
             try:
-                info = await song_loader.extract_info_async(track["url"])
+                track_url = track.get("url", "")
+                if not track_url:
+                    failed += 1
+                    continue
+                    
+                info = await song_loader.extract_info_async(track_url)
+                if not info:
+                    failed += 1
+                    continue
+                    
                 song_data = info["entries"][0] if "entries" in info and info["entries"] else info
+                if not song_data:
+                    failed += 1
+                    continue
+                    
                 processed = await self.process_single_entry(song_data, requester=interaction.user)
                 if processed:
                     queue.add(processed)
                     added += 1
-            except Exception:
-                pass
-                
-        await interaction.followup.send(f"Added {added} songs from playlist **{name}** to the end of the queue.")
+            except Exception as e:
+                logger.error(f"Failed to add track {i+1}/{total} from playlist {name}: {e}")
+                failed += 1
+                continue
+            
+            # Update progress every 3 tracks
+            if (i + 1) % 3 == 0 or (i + 1) == total:
+                try:
+                    await loading_msg.edit(
+                        embed=self.make_embed(
+                            title="📂 Loading Playlist",
+                            description=f"Loading **{name}**...\nProcessed {i + 1}/{total} tracks",
+                            color=0x3498db,
+                            fields=[
+                                ("Added", f"```\n{added}\n```", True),
+                                ("Failed", f"```\n{failed}\n```", True),
+                            ]
+                        )
+                    )
+                except:
+                    pass
         
-        if not voice_client.is_playing() and not voice_client.is_paused():
-            await self.play_next(interaction)
+        # Final summary
+        if added == 0:
+            await loading_msg.edit(
+                embed=self.make_embed(
+                    title="❌ Playlist Load Failed",
+                    description=f"Could not load any tracks from **{name}**.",
+                    color=0xe74c3c
+                )
+            )
+            return
+        
+        summary_desc = f"Successfully loaded **{added}** track{'s' if added != 1 else ''} from **{name}**."
+        if failed > 0:
+            summary_desc += f"\n⚠️ {failed} track{'s' if failed != 1 else ''} failed to load."
+        
+        await loading_msg.edit(
+            embed=self.make_embed(
+                title="✅ Playlist Loaded",
+                description=summary_desc,
+                color=0x2ecc71,
+                fields=[
+                    ("Total in Queue", f"```\n{len(queue.queue)}\n```", True),
+                    ("Position", f"```\n#{len(queue.queue) - added + 1}\n```", True),
+                ]
+            )
+        )
+        
+        # Start playback using the correct method
+        await self._maybe_play(voice_client, queue, interaction, check_empty=False)
 
     async def cog_load(self):
         self.bot.tree.add_command(self.playlist_group, guild=discord.Object(id=SYNC_SERVER))

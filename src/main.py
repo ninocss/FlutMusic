@@ -10,7 +10,6 @@ from discord.ext import commands
 from util.constants import *
 from cogs.music import MusicCog
 from cogs.radio import RadioCog
-from cogs.updater import UpdaterCog
 
 # Setup colored logging
 def setup_logging() -> logging.Logger:
@@ -55,8 +54,7 @@ class Bot(commands.Bot):
         # Add cogs
         cogs = [
             MusicCog(self),
-            RadioCog(self),
-            UpdaterCog(self)
+            RadioCog(self)
         ]
         
         for cog in cogs:

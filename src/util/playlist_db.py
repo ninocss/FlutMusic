@@ -21,60 +21,60 @@ async def _save_playlists(data: Dict):
         with open(PLAYLIST_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=4)
 
-async def create_playlist(user_id: str, name: str) -> bool:
-    """Create a new playlist for the user."""
+async def create_playlist(guild_id: str, name: str) -> bool:
+    """Create a new playlist for the server."""
     data = await _load_playlists()
-    user_id = str(user_id)
-    if user_id not in data:
-        data[user_id] = {}
+    guild_id = str(guild_id)
+    if guild_id not in data:
+        data[guild_id] = {}
     
-    if name in data[user_id]:
+    if name in data[guild_id]:
         return False
         
-    data[user_id][name] = []
+    data[guild_id][name] = []
     await _save_playlists(data)
     return True
 
-async def delete_playlist(user_id: str, name: str) -> bool:
-    """Delete a user's playlist."""
+async def delete_playlist(guild_id: str, name: str) -> bool:
+    """Delete a server's playlist."""
     data = await _load_playlists()
-    user_id = str(user_id)
-    if user_id in data and name in data[user_id]:
-        del data[user_id][name]
+    guild_id = str(guild_id)
+    if guild_id in data and name in data[guild_id]:
+        del data[guild_id][name]
         await _save_playlists(data)
         return True
     return False
 
-async def add_to_playlist(user_id: str, name: str, url: str, title: str) -> bool:
+async def add_to_playlist(guild_id: str, name: str, url: str, title: str) -> bool:
     """Add a song to a playlist."""
     data = await _load_playlists()
-    user_id = str(user_id)
-    if user_id not in data or name not in data[user_id]:
+    guild_id = str(guild_id)
+    if guild_id not in data or name not in data[guild_id]:
         return False
         
-    data[user_id][name].append({"url": url, "title": title})
+    data[guild_id][name].append({"url": url, "title": title})
     await _save_playlists(data)
     return True
 
-async def import_playlist_tracks(user_id: str, name: str, tracks: List[Dict]) -> bool:
+async def import_playlist_tracks(guild_id: str, name: str, tracks: List[Dict]) -> bool:
     """Import multiple tracks into a playlist."""
     data = await _load_playlists()
-    user_id = str(user_id)
-    if user_id not in data or name not in data[user_id]:
+    guild_id = str(guild_id)
+    if guild_id not in data or name not in data[guild_id]:
         return False
         
-    data[user_id][name].extend(tracks)
+    data[guild_id][name].extend(tracks)
     await _save_playlists(data)
     return True
 
-async def get_playlist(user_id: str, name: str) -> Optional[List[Dict]]:
+async def get_playlist(guild_id: str, name: str) -> Optional[List[Dict]]:
     """Get all tracks in a playlist."""
     data = await _load_playlists()
-    user_id = str(user_id)
-    return data.get(user_id, {}).get(name)
+    guild_id = str(guild_id)
+    return data.get(guild_id, {}).get(name)
 
-async def get_user_playlists(user_id: str) -> List[str]:
-    """Get names of all playlists for a user."""
+async def get_guild_playlists(guild_id: str) -> List[str]:
+    """Get names of all playlists for a server."""
     data = await _load_playlists()
-    user_id = str(user_id)
-    return list(data.get(user_id, {}).keys())
+    guild_id = str(guild_id)
+    return list(data.get(guild_id, {}).keys())
