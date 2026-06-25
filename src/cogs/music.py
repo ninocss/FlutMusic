@@ -136,8 +136,9 @@ async def purge_channel(channel: discord.TextChannel, limit: Optional[int] = Non
         if not messages:
             return 0
         
-        recent_messages = [msg for msg in messages if msg.age.days < 14]
-        old_messages = [msg for msg in messages if msg.age.days >= 14]
+        now = discord.utils.utcnow()
+        recent_messages = [msg for msg in messages if (now - msg.created_at).days < 14]
+        old_messages = [msg for msg in messages if (now - msg.created_at).days >= 14]
         
         while recent_messages:
             batch = recent_messages[:100]
@@ -344,14 +345,14 @@ class MusicCog(commands.Cog):
                         message.author == self.bot.user and
                         message.embeds and
                         message.embeds[0].title and
-                        "Music Controls" in message.embeds[0].title
+                        "Marcante Musik" in message.embeds[0].title
                     ):
                         await message.delete()
                     if (
                         message.author == self.bot.user and
                         message.embeds and
                         message.embeds[0].title and
-                        "Music Bot" in message.embeds[0].title
+                        "Music" in message.embeds[0].title
                     ):
                         await message.delete()
 
@@ -1828,7 +1829,8 @@ class MusicCog(commands.Cog):
 
         wait_time = 0
         display_count = min(10, len(queue.queue))
-        for i, song_data in enumerate(queue.queue[:display_count]):
+        queue_as_list = list(queue.queue)
+        for i, song_data in enumerate(queue_as_list[:display_count]):
             title = song_data['title']
             duration = song_data['duration']
 
@@ -3153,17 +3155,19 @@ class MusicCog(commands.Cog):
         
         for i, track in enumerate(tracks):
             try:
-                track_url = track["url"]
-                if needs_resolution(track_url):
-                    direct = await resolve_to_direct_url(track_url)
-                    if direct:
-                        track_url = direct
-                info = await song_loader.extract_info_async(track_url)
                 track_url = track.get("url", "")
                 if not track_url:
                     failed += 1
                     continue
                     
+                if needs_resolution(track_url):
+                    direct = await resolve_to_direct_url(track_url)
+                    if direct:
+                        track_url = direct
+                    else:
+                        failed += 1
+                        continue
+                        
                 info = await song_loader.extract_info_async(track_url)
                 if not info:
                     failed += 1
@@ -3178,8 +3182,9 @@ class MusicCog(commands.Cog):
                 if processed:
                     queue.add(processed)
                     added += 1
-            except Exception:
-                pass
+            except Exception as e:
+                logger.error(f"Error processing track {i}: {e}")
+                failed += 1
                 
         await interaction.followup.send(f"Added {added} songs from playlist **{name}** to the end of the queue.")
         
@@ -3264,6 +3269,24 @@ class MusicCog(commands.Cog):
         if not voice_client.is_playing() and not voice_client.is_paused():
             await self.play_next(interaction.guild, voice_client, interaction)
 
+    @app_commands.command(name="purge", description="Purge bot messages from a channel")
+    @app_commands.describe(channel="purge messages from a Channel (default: current channel)")
+    async def purge_test(self, interaction: discord.Interaction, channel: Optional[discord.TextChannel] = None):
+        await interaction.response.defer(ephemeral=True)
+        
+        target_channel = channel or interaction.channel
+        
+        try:
+            deleted_count = await purge_channel(target_channel)
+            await interaction.followup.send(f"✅ Successfully purged **{deleted_count}** bot messages from {target_channel.mention}.")
+            
+            # Resend static music embed if purged channel is the music channel
+            if str(target_channel.id) == str(I_CHANNEL):
+                await self.send_static_message()
+                      
+        except Exception as e:
+            await interaction.followup.send(f"❌ Failed to purge messages: {e}")
+
     @app_commands.command(name="stats", description="Show bot statistics")
     async def botstats(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
@@ -3313,6 +3336,7 @@ class MusicCog(commands.Cog):
         self.bot.tree.add_command(self.remove, guild=discord.Object(id=SYNC_SERVER))
         self.bot.tree.add_command(self.botstats, guild=discord.Object(id=SYNC_SERVER))
         self.bot.tree.add_command(self.musicmute_list, guild=discord.Object(id=SYNC_SERVER))
+        self.bot.tree.add_command(self.purge_test, guild=discord.Object(id=SYNC_SERVER))
 
     async def cog_unload(self):
         for task in self.background_tasks:
