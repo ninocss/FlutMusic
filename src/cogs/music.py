@@ -16,7 +16,7 @@ from util.resolver import (
     resolve_to_search_query, resolve_to_direct_url, resolve_playlist,
     needs_resolution, is_playlist, get_source_name
 )
-from views.musicviews import ActionsView, LyricsButtonView, QueueView
+from views.musicviews import ActionsView, LyricsButtonView, QueueView, NowPlayingView
 import json
 
 from util.playlist_db import (
@@ -495,6 +495,9 @@ class MusicCog(commands.Cog):
 
         if next_song_data:
             try:
+                logger.info(f"Playing: {next_song_data.get('title', 'Unknown')} (duration: {next_song_data.get('duration', 0)}, views: {next_song_data.get('views', 0)}, likes: {next_song_data.get('likes', 0)})")
+                logger.info(f"Song URL: {next_song_data.get('song_url', 'Unknown')}")
+                
                 webpage_url = next_song_data['song_url']
                 
                 fresh_info = await song_loader.extract_info_async(webpage_url)
@@ -587,8 +590,23 @@ class MusicCog(commands.Cog):
             
             embed = self.create_now_playing_embed(metadata, interaction)
             try:
-                lyrics_view = LyricsButtonView(self, next_song_data['title'], next_song_data['author'])
-                msg = await interaction.channel.send(embed=embed, view=lyrics_view)
+                # Delete old now-playing messages with buttons
+                channel = interaction.channel
+                async for msg in channel.history(limit=50):
+                    if msg.author == self.bot.user and msg.components:
+                        # Check if it has a Now Playing or Last Played embed
+                        if msg.embeds and any(
+                            emb.title in ["Now playing", "Last Played", "Now Playing"]
+                            for emb in msg.embeds
+                        ):
+                            try:
+                                await msg.delete()
+                            except Exception:
+                                pass
+                
+                # Send new message with action buttons
+                np_view = NowPlayingView(self, next_song_data['title'], next_song_data['author'])
+                msg = await interaction.channel.send(embed=embed, view=np_view)
                 self._schedule_progress(guild.id, msg, embed, next_song_data['duration'])
             except Exception as e:
                 logger.error(f"Error sending now playing message: {e}")
@@ -763,8 +781,23 @@ class MusicCog(commands.Cog):
                     processed.get('requested_by_id'),
                 ), interaction)
                 try:
-                    lyrics_view = LyricsButtonView(self, processed['title'], processed['author'])
-                    msg = await interaction.channel.send(embed=embed, view=lyrics_view)
+                    # Delete old now-playing messages with buttons
+                    channel = interaction.channel
+                    async for msg in channel.history(limit=50):
+                        if msg.author == self.bot.user and msg.components:
+                            # Check if it has a Now Playing or Last Played embed
+                            if msg.embeds and any(
+                                emb.title in ["Now playing", "Last Played", "Now Playing"]
+                                for emb in msg.embeds
+                            ):
+                                try:
+                                    await msg.delete()
+                                except Exception:
+                                    pass
+                    
+                    # Send new message with action buttons
+                    np_view = NowPlayingView(self, processed['title'], processed['author'])
+                    msg = await interaction.channel.send(embed=embed, view=np_view)
                     self._schedule_progress(guild.id, msg, embed, processed['duration'])
                 except Exception as e:
                     logger.error(f"Error sending now playing message: {e}")
@@ -939,7 +972,7 @@ class MusicCog(commands.Cog):
         try:
             await asyncio.sleep(max(0, int(duration)))
             embed.color = 0x95a5a6
-            embed.title = "Was playing"
+            embed.title = "Last Played"
             embed.set_footer(text="Playback finished", icon_url=safe_avatar(self.bot.user))
             await message.edit(embed=embed)
         except (discord.HTTPException, asyncio.CancelledError):
@@ -3010,30 +3043,62 @@ class MusicCog(commands.Cog):
                 
                 for i, t in enumerate(resolved):
                     try:
-                        # Resolvers return "query" key (ytsearch:...), need to resolve to actual URL
-                        query_url = t.get("query", t.get("url", ""))
-                        if query_url.startswith("ytsearch:"):
-                            # Extract the search query and resolve to actual YouTube URL
-                            search_info = await song_loader.extract_info_async(query_url)
-                            if search_info:
-                                # Get the first result's actual URL
-                                if "entries" in search_info and search_info["entries"]:
-                                    actual_url = search_info["entries"][0].get("url", "")
-                                else:
-                                    actual_url = search_info.get("url", "")
-                                
-                                if actual_url:
-                                    tracks.append({"url": actual_url, "title": t.get("title", "Unknown")})
-                                else:
-                                    failed_count += 1
+                        # Resolvers return track data with "query" key (ytsearch:...) or "url" key
+                        query = t.get("query", "")
+                        video_url = t.get("url", "")
+                        video_id = t.get("id", "")
+                        video_title = t.get("title", "Unknown")
+                        
+                        logger.info(f"Track {i+1} from resolver: query={query[:80] if query else 'None'}..., url={video_url[:80] if video_url else 'None'}..., id={video_id}")
+                        
+                        final_url = ""
+                        
+                        # If we have a query (ytsearch:...), resolve it to a real YouTube URL
+                        if query and query.startswith("ytsearch:"):
+                            logger.info(f"Resolving query to YouTube URL for track {i+1}")
+                            search_info = await song_loader.extract_info_async(query)
+                            if search_info and "entries" in search_info and search_info["entries"]:
+                                first_result = search_info["entries"][0]
+                                # Get the YouTube watch URL (not stream URL!)
+                                final_url = first_result.get("webpage_url") or first_result.get("original_url") or first_result.get("url", "")
+                                logger.info(f"Resolved to: {final_url}")
                             else:
+                                logger.warning(f"Could not resolve query for track {i+1}: {query}")
                                 failed_count += 1
+                                continue
+                        elif video_id:
+                            # If we have a video ID, construct the YouTube watch URL
+                            final_url = f"https://www.youtube.com/watch?v={video_id}"
+                            logger.info(f"Constructed URL from ID: {final_url}")
+                        elif video_url and ("youtube.com/watch" in video_url or "youtu.be" in video_url):
+                            # Already a YouTube watch URL
+                            final_url = video_url
+                            logger.info(f"Using existing URL: {final_url[:80]}...")
+                        elif video_url and "googlevideo.com" in video_url:
+                            # This is a stream URL - extract video ID using regex
+                            import re
+                            # Try to extract video ID from various URL patterns
+                            id_match = re.search(r'[?&]id=([\w-]{11})', video_url)
+                            if id_match:
+                                video_id = id_match.group(1)
+                                final_url = f"https://www.youtube.com/watch?v={video_id}"
+                                logger.info(f"Extracted ID from stream URL: {final_url}")
+                            else:
+                                logger.warning(f"Cannot extract ID from stream URL for track {i+1}")
+                                failed_count += 1
+                                continue
                         else:
-                            # Already a URL
-                            if query_url:
-                                tracks.append({"url": query_url, "title": t.get("title", "Unknown")})
-                            else:
-                                failed_count += 1
+                            logger.warning(f"Unrecognized format for track {i+1}")
+                            failed_count += 1
+                            continue
+                        
+                        # Save the final YouTube URL
+                        if final_url:
+                            tracks.append({"url": final_url, "title": video_title})
+                            logger.info(f"Saved track {i+1}: {video_title} -> {final_url[:80]}...")
+                        else:
+                            logger.warning(f"No URL for track {i+1}")
+                            failed_count += 1
                     except Exception as e:
                         logger.error(f"Failed to resolve track {i+1}: {e}")
                         failed_count += 1
@@ -3133,6 +3198,10 @@ class MusicCog(commands.Cog):
             return
 
         tracks = await get_playlist(interaction.guild.id, name)
+        logger.info(f"Playlist '{name}' loaded: {len(tracks) if tracks else 0} tracks")
+        if tracks:
+            logger.info(f"First track raw data: {tracks[0]}")
+        
         if tracks is None:
             await interaction.followup.send(f"Playlist **{name}** not found.", ephemeral=True)
             return
@@ -3157,24 +3226,30 @@ class MusicCog(commands.Cog):
             try:
                 track_url = track.get("url", "")
                 if not track_url:
+                    logger.warning(f"Track {i} in playlist {name} has no URL")
                     failed += 1
                     continue
                     
                 if needs_resolution(track_url):
+                    logger.info(f"Resolving URL for track {i}: {track_url}")
                     direct = await resolve_to_direct_url(track_url)
                     if direct:
                         track_url = direct
+                        logger.info(f"Resolved to: {track_url}")
                     else:
+                        logger.warning(f"Failed to resolve track {i}: {track_url}")
                         failed += 1
                         continue
                         
                 info = await song_loader.extract_info_async(track_url)
                 if not info:
+                    logger.warning(f"Failed to extract info for track {i}: {track_url}")
                     failed += 1
                     continue
                     
                 song_data = info["entries"][0] if "entries" in info and info["entries"] else info
                 if not song_data:
+                    logger.warning(f"No song data for track {i}: {track_url}")
                     failed += 1
                     continue
                     

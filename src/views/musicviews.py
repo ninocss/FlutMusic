@@ -42,6 +42,153 @@ handler.setFormatter(colorlog.ColoredFormatter(
 logging.basicConfig(level=logging.INFO, handlers=[handler])
 logger = logging.getLogger(__name__)
 
+class NowPlayingView(View):
+    """Now Playing view with playback controls and lyrics button."""
+    
+    def __init__(self, music_cog, song_title: str, song_artist: str):
+        super().__init__(timeout=None)
+        self.music_cog = music_cog
+        self.song_title = song_title
+        self.song_artist = song_artist
+        
+        # Play/Pause button
+        play_pause_btn = Button(emoji="⏯️", style=GREEN, row=0)
+        play_pause_btn.callback = self.play_pause_callback
+        self.add_item(play_pause_btn)
+        
+        # Skip button
+        skip_btn = Button(emoji="⏭️", style=SECONDARY, row=0)
+        skip_btn.callback = self.skip_callback
+        self.add_item(skip_btn)
+        
+        # Stop button
+        stop_btn = Button(emoji="⏹️", style=DANGER, row=0)
+        stop_btn.callback = self.stop_callback
+        self.add_item(stop_btn)
+        
+        # Lyrics button
+        lyrics_btn = Button(label="Lyrics", emoji="🎤", style=PURPLE, row=0)
+        lyrics_btn.callback = self.lyrics_callback
+        self.add_item(lyrics_btn)
+    
+    async def play_pause_callback(self, interaction: discord.Interaction):
+        try:
+            music_cog = self.music_cog
+            voice_client = interaction.guild.voice_client
+            
+            if not voice_client or not voice_client.is_connected():
+                await interaction.response.send_message("Not connected to voice.", ephemeral=True)
+                return
+            
+            if voice_client.is_playing():
+                voice_client.pause()
+                await interaction.response.send_message("⏸️ Paused", ephemeral=True)
+            elif voice_client.is_paused():
+                voice_client.resume()
+                await interaction.response.send_message("▶️ Resumed", ephemeral=True)
+            else:
+                await interaction.response.send_message("Nothing is playing.", ephemeral=True)
+        except Exception as e:
+            logger.error(f"Play/Pause error: {e}")
+            await interaction.response.send_message("An error occurred.", ephemeral=True)
+    
+    async def skip_callback(self, interaction: discord.Interaction):
+        try:
+            music_cog = self.music_cog
+            voice_client = interaction.guild.voice_client
+            
+            if not voice_client or not voice_client.is_connected():
+                await interaction.response.send_message("Not connected to voice.", ephemeral=True)
+                return
+            
+            if voice_client.is_playing():
+                voice_client.stop()
+                await interaction.response.send_message("⏭️ Skipped", ephemeral=True)
+            else:
+                await interaction.response.send_message("Nothing is playing.", ephemeral=True)
+        except Exception as e:
+            logger.error(f"Skip error: {e}")
+            await interaction.response.send_message("An error occurred.", ephemeral=True)
+    
+    async def stop_callback(self, interaction: discord.Interaction):
+        try:
+            music_cog = self.music_cog
+            voice_client = interaction.guild.voice_client
+            
+            if not voice_client or not voice_client.is_connected():
+                await interaction.response.send_message("Not connected to voice.", ephemeral=True)
+                return
+            
+            # Access the global guild_queues
+            from cogs.music import guild_queues
+            queue = guild_queues.get(interaction.guild.id)
+            if queue:
+                queue.clear()
+            
+            voice_client.stop()
+            await voice_client.disconnect()
+            music_cog.currently_playing.pop(interaction.guild.id, None)
+            await music_cog._reset_activity()
+            await music_cog.send_static_message()
+            
+            await interaction.response.send_message("⏹️ Stopped and disconnected", ephemeral=True)
+        except Exception as e:
+            logger.error(f"Stop error: {e}")
+            await interaction.response.send_message("An error occurred.", ephemeral=True)
+    
+    async def lyrics_callback(self, interaction: discord.Interaction):
+        button = interaction.message.components[0].children[3]  # Lyrics button
+        button.disabled = True
+        await interaction.response.edit_message(view=self)
+        
+        loading_embed = discord.Embed(
+            title="🎤 Fetching Lyrics...",
+            description=f"Searching for lyrics for **{self.song_title}**...",
+            color=0x3498db
+        )
+        await interaction.followup.send(embed=loading_embed, ephemeral=True)
+        
+        try:
+            lyrics_data = await fetch_lyrics(self.song_title, self.song_artist)
+            if not lyrics_data or not lyrics_data.get('plain_lyrics'):
+                no_lyrics_embed = discord.Embed(
+                    title="❌ Lyrics not found",
+                    description=f"No lyrics found for **{self.song_title}** by **{self.song_artist}**.",
+                    color=0xe74c3c
+                )
+                await interaction.followup.send(embed=no_lyrics_embed, ephemeral=True)
+                return
+            
+            lines = lyrics_data['plain_lyrics'].splitlines()
+            lines_per_page = 20
+            total_pages = max(1, (len(lines) + lines_per_page - 1) // lines_per_page)
+            
+            def make_lyrics_page(page: int):
+                start = page * lines_per_page
+                end = min(start + lines_per_page, len(lines))
+                page_lines = lines[start:end]
+                lyrics_text = '\n'.join(page_lines)
+                
+                embed = discord.Embed(
+                    title=f"🎤 {self.song_title}",
+                    description=f"**Artist:** {self.song_artist}\n\n```\n{lyrics_text}\n```",
+                    color=0x5865F2
+                )
+                embed.set_footer(text=f"Page {page + 1}/{total_pages}")
+                return embed
+            
+            lyrics_view = LyricsView(lyrics_data)
+            await interaction.followup.send(embed=make_lyrics_page(0), view=lyrics_view, ephemeral=True)
+            
+        except Exception as e:
+            logger.error(f"Error fetching lyrics: {e}")
+            error_embed = discord.Embed(
+                title="❌ Error",
+                description="Failed to fetch lyrics.",
+                color=0xe74c3c
+            )
+            await interaction.followup.send(embed=error_embed, ephemeral=True)
+
 class ActionsView(View):
     def __init__(self, bot):
         super().__init__(timeout=None)
