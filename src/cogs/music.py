@@ -293,6 +293,8 @@ class OptimizedQueue:
         self.queue = deque()
         self.playing = False
         self.lock = asyncio.Lock()
+        self._loop_played = []
+        self._last_playback_error = None
 
     def add(self, song_data):
         self.queue.append(song_data)
@@ -329,6 +331,7 @@ class MusicCog(commands.Cog):
         self._load_timeouts()
         self._playlist_cache_time = 0
         self._playlist_cache_ttl = 3600  # 1 hour
+        self._ytmusic = YTMusic()
 
     def make_embed(
         self,
@@ -419,7 +422,7 @@ class MusicCog(commands.Cog):
 
         webpage_url = song_data.get('song_url')
         title = song_data.get('title', 'Unknown')
-        error_str = str(getattr(queue, '_last_playback_error', 'Unknown error'))
+        error_str = str(queue._last_playback_error or 'Unknown error')
 
         # Notify user on first failure
         if retry_count == 0:
@@ -513,8 +516,6 @@ class MusicCog(commands.Cog):
             if loop_mode == 'song' and song_data:
                 queue.queue.appendleft(song_data)
             elif loop_mode == 'queue' and song_data:
-                if not hasattr(queue, '_loop_played'):
-                    queue._loop_played = []
                 queue._loop_played.append(song_data)
                 if queue.is_empty() and queue._loop_played:
                     for s in queue._loop_played:
@@ -536,11 +537,11 @@ class MusicCog(commands.Cog):
             return
 
         lock = self._play_next_locks.setdefault(guild.id, asyncio.Lock())
-        if lock.locked():
-            return
         async with lock:
             music_channel = await self._get_music_channel(interaction)
-            queue = guild_queues[guild.id]
+            queue = guild_queues.get(guild.id)
+            if not queue:
+                return
 
             async with queue.lock:
                 if voice_client.is_playing():
@@ -743,8 +744,7 @@ class MusicCog(commands.Cog):
                     video_id = video_id_match.group(1)
 
                     def _fetch_related():
-                        yt = YTMusic()
-                        return yt.get_song_related(video_id)
+                        return self._ytmusic.get_song_related(video_id)
 
                     related_songs = await asyncio.get_running_loop().run_in_executor(
                         song_loader.executor, _fetch_related
@@ -947,7 +947,8 @@ class MusicCog(commands.Cog):
             await channel.connect(self_deaf=True)
             voice_client = interaction.guild.voice_client
             if SET_VC_STATUS_TO_MUSIC_PLAYING:
-                current_song = queue.peek()['title'] if queue.peek() else "Music"
+                p = queue.peek()
+                current_song = p['title'] if p else "Music"
                 try:
                     await voice_client.channel.edit(status=f"Listening to: {current_song}")
                 except Exception:
@@ -1704,7 +1705,7 @@ class MusicCog(commands.Cog):
 
             processed_songs, skipped = await self.process_song_entries(entries, interaction.guild.id, requester=interaction.user, original_source=original_source_name, flat=is_flat_playlist)
 
-            titles_list = "\n".join([f"- {song['title']}" for song in processed_songs[:10]])
+            titles_list = "\n".join([f"- {s['title']}" for s in processed_songs[:10]])
             if len(processed_songs) > 10:
                 titles_list += f"\n\n...and {len(processed_songs) - 10} more."
 
@@ -1855,13 +1856,15 @@ class MusicCog(commands.Cog):
         total_pages = max(1, (len(queue.queue) + items_per_page - 1) // items_per_page)
         total_duration = sum(song['duration'] for song in queue.queue)
 
+        queue_snapshot = list(queue.queue)
+
         def make_queue_embed(page: int = 0):
             start_idx = page * items_per_page
-            end_idx = min(start_idx + items_per_page, len(queue.queue))
-            page_items = list(queue.queue)[start_idx:end_idx]
+            end_idx = min(start_idx + items_per_page, len(queue_snapshot))
+            page_items = queue_snapshot[start_idx:end_idx]
 
             embed = self.make_embed(
-                title=f"Queue ({len(queue.queue)} songs)",
+                title=f"Queue ({len(queue_snapshot)} songs)",
                 description="Upcoming tracks:",
                 color=0x5865F2,
                 author_name=interaction.user.display_name,
@@ -1871,7 +1874,7 @@ class MusicCog(commands.Cog):
                 thumbnail=safe_avatar(interaction.user)
             )
 
-            wait_time = sum(song['duration'] for song in list(queue.queue)[:start_idx])
+            wait_time = sum(s['duration'] for s in queue_snapshot[:start_idx])
             for i, song_data in enumerate(page_items):
                 idx = start_idx + i + 1
                 title = song_data['title']
@@ -1885,7 +1888,7 @@ class MusicCog(commands.Cog):
 
             return embed
 
-        view = QueueView(list(queue.queue), make_queue_embed, items_per_page)
+        view = QueueView(queue_snapshot, make_queue_embed, items_per_page)
         embed = make_queue_embed(0)
         await interaction.response.send_message(embed=embed, view=view)
 
@@ -2520,6 +2523,7 @@ class MusicCog(commands.Cog):
                 await self.update_message_embed(interaction.message)
 
                 if len(self.yes) >= self.required and not self.ended_early:
+                    self.ended_early = True
                     cleared_count = len(queue.queue)
                     total_duration = sum(song['duration'] for song in queue.queue)
                     queue.clear()
@@ -2539,7 +2543,6 @@ class MusicCog(commands.Cog):
                         ]
                     )
 
-                    self.ended_early = True
                     self.result_embed = result_embed
 
                     for child in self.children:
@@ -2936,8 +2939,6 @@ class MusicCog(commands.Cog):
                     if loop_mode == 'song' and song_data:
                         queue.queue.appendleft(song_data)
                     elif loop_mode == 'queue' and song_data:
-                        if not hasattr(queue, '_loop_played'):
-                            queue._loop_played = []
                         queue._loop_played.append(song_data)
                         if queue.is_empty() and queue._loop_played:
                             for s in queue._loop_played:
@@ -3128,85 +3129,62 @@ class MusicCog(commands.Cog):
                 
                 failed_count = 0
                 total = len(resolved)
-                
-                for i, t in enumerate(resolved):
-                    try:
-                        # Resolvers return track data with "query" key (ytsearch:...) or "url" key
+                BATCH_SIZE = 5
+
+                for batch_start in range(0, total, BATCH_SIZE):
+                    batch = resolved[batch_start:batch_start + BATCH_SIZE]
+
+                    async def _resolve_one(t):
                         query = t.get("query", "")
                         video_url = t.get("url", "")
                         video_id = t.get("id", "")
                         video_title = t.get("title", "Unknown")
-                        
-                        logger.info(f"Track {i+1} from resolver: query={query[:80] if query else 'None'}..., url={video_url[:80] if video_url else 'None'}..., id={video_id}")
-                        
                         final_url = ""
-                        
-                        # If we have a query (ytsearch:...), resolve it to a real YouTube URL
+
                         if query and query.startswith("ytsearch:"):
-                            logger.info(f"Resolving query to YouTube URL for track {i+1}")
-                            search_info = await song_loader.extract_info_async(query)
-                            if search_info and "entries" in search_info and search_info["entries"]:
-                                first_result = search_info["entries"][0]
-                                # Get the YouTube watch URL (not stream URL!)
-                                final_url = first_result.get("webpage_url") or first_result.get("original_url") or first_result.get("url", "")
-                                logger.info(f"Resolved to: {final_url}")
-                            else:
-                                logger.warning(f"Could not resolve query for track {i+1}: {query}")
-                                failed_count += 1
-                                continue
+                            try:
+                                search_info = await song_loader.extract_info_async(query)
+                                if search_info and "entries" in search_info and search_info["entries"]:
+                                    first_result = search_info["entries"][0]
+                                    final_url = first_result.get("webpage_url") or first_result.get("original_url") or first_result.get("url", "")
+                            except Exception:
+                                return None
                         elif video_id:
-                            # If we have a video ID, construct the YouTube watch URL
                             final_url = f"https://www.youtube.com/watch?v={video_id}"
-                            logger.info(f"Constructed URL from ID: {final_url}")
                         elif video_url and ("youtube.com/watch" in video_url or "youtu.be" in video_url):
-                            # Already a YouTube watch URL
                             final_url = video_url
-                            logger.info(f"Using existing URL: {final_url[:80]}...")
                         elif video_url and "googlevideo.com" in video_url:
-                            # This is a stream URL - extract video ID using regex
-                            import re
-                            # Try to extract video ID from various URL patterns
                             id_match = re.search(r'[?&]id=([\w-]{11})', video_url)
                             if id_match:
-                                video_id = id_match.group(1)
-                                final_url = f"https://www.youtube.com/watch?v={video_id}"
-                                logger.info(f"Extracted ID from stream URL: {final_url}")
-                            else:
-                                logger.warning(f"Cannot extract ID from stream URL for track {i+1}")
-                                failed_count += 1
-                                continue
-                        else:
-                            logger.warning(f"Unrecognized format for track {i+1}")
-                            failed_count += 1
-                            continue
-                        
-                        # Save the final YouTube URL
+                                final_url = f"https://www.youtube.com/watch?v={id_match.group(1)}"
+
                         if final_url:
-                            tracks.append({"url": final_url, "title": video_title})
-                            logger.info(f"Saved track {i+1}: {video_title} -> {final_url[:80]}...")
+                            return {"url": final_url, "title": video_title}
+                        return None
+
+                    results = await asyncio.gather(*[_resolve_one(t) for t in batch], return_exceptions=True)
+
+                    for r in results:
+                        if isinstance(r, dict):
+                            tracks.append(r)
                         else:
-                            logger.warning(f"No URL for track {i+1}")
                             failed_count += 1
-                    except Exception as e:
-                        logger.error(f"Failed to resolve track {i+1}: {e}")
-                        failed_count += 1
-                    
-                    # Update progress every 3 tracks
-                    if (i + 1) % 3 == 0 or (i + 1) == total:
-                        try:
-                            await loading_msg.edit(
-                                embed=self.make_embed(
-                                    title="🔍 Resolving Tracks",
-                                    description=f"Resolving **{name}**...\nProcessed {i + 1}/{total} tracks",
-                                    color=0x3498db,
-                                    fields=[
-                                        ("Resolved", f"```\n{i + 1 - failed_count}\n```", True),
-                                        ("Failed", f"```\n{failed_count}\n```", True),
-                                    ]
-                                )
+
+                    processed = min(batch_start + BATCH_SIZE, total)
+                    try:
+                        await loading_msg.edit(
+                            embed=self.make_embed(
+                                title="🔍 Resolving Tracks",
+                                description=f"Resolving **{name}**...\nProcessed {processed}/{total} tracks",
+                                color=0x3498db,
+                                fields=[
+                                    ("Resolved", f"```\n{len(tracks)}\n```", True),
+                                    ("Failed", f"```\n{failed_count}\n```", True),
+                                ]
                             )
-                        except:
-                            pass
+                        )
+                    except Exception:
+                        pass
             else:
                 # Single URL or non-playlist
                 loading_msg = await interaction.followup.send(
@@ -3268,6 +3246,8 @@ class MusicCog(commands.Cog):
 
     @playlist_group.command(name="play", description="Play a saved playlist")
     async def playlist_play(self, interaction: discord.Interaction, name: str):
+        if await self.check_timeout_decorator(interaction):
+            return
         await interaction.response.defer()
 
         if interaction.guild.id not in guild_queues:
@@ -3366,6 +3346,8 @@ class MusicCog(commands.Cog):
 
     @dynamic_playlist_group.command(name="play", description="Play a dynamic playlist (fetches tracks live)")
     async def dynamic_playlist_play(self, interaction: discord.Interaction, name: str):
+        if await self.check_timeout_decorator(interaction):
+            return
         await interaction.response.defer()
 
         if interaction.guild.id not in guild_queues:
