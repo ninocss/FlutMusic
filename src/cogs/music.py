@@ -7,11 +7,11 @@ import asyncio
 import random
 import concurrent.futures
 from typing import List, Optional, Tuple
+from cachetools import TTLCache
 from util.constants import *
 from util.music.queue import *
 from modals.embeds import *
 from lang.texts import *
-from views.musicviews import ActionsView
 from util.resolver import (
     resolve_to_search_query, resolve_to_direct_url, resolve_playlist,
     needs_resolution, is_playlist, get_source_name
@@ -28,13 +28,13 @@ from util.dynamic_playlist_db import (
     get_dynamic_playlist, get_user_dynamic_playlists,
     fetch_dynamic_tracks
 )
-from util.cleaner import purge_channel
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from ytmusicapi import YTMusic
 import re
 
 import time
+import threading
 from collections import deque
 from util.lyrics import fetch_lyrics
 import logging
@@ -60,6 +60,7 @@ guild_queues = {}
 guild_volumes = {}
 
 AUTOPLAY_URL_RE = re.compile(r"(https?://[^\s)]+)", re.IGNORECASE)
+YT_PLAYLIST_RE = re.compile(r'(?:youtube|music\.youtube|youtu\.be).*(?:/playlist|list=)', re.I)
 
 MUSIC_SOURCES = {
     "spotify":   {"domain": "open.spotify.com",     "label": "Spotify",     "icon": "🎧", "extractor": "spotify"},
@@ -207,16 +208,67 @@ async def purge_channel(channel: discord.TextChannel, limit: Optional[int] = Non
     
     return deleted_count
 
+class ThreadSafeTTLCache:
+    def __init__(self, maxsize, ttl):
+        self._cache = TTLCache(maxsize=maxsize, ttl=ttl)
+        self._lock = threading.RLock()
+
+    def __contains__(self, key):
+        with self._lock:
+            return key in self._cache
+
+    def get(self, key, default=None):
+        with self._lock:
+            return self._cache.get(key, default)
+
+    def __getitem__(self, key):
+        with self._lock:
+            return self._cache[key]
+
+    def __setitem__(self, key, value):
+        with self._lock:
+            self._cache[key] = value
+
+    def pop(self, key, default=None):
+        with self._lock:
+            return self._cache.pop(key, default)
+
+_extract_cache = ThreadSafeTTLCache(maxsize=200, ttl=240)
+
 class AsyncSongLoader:
-    def __init__(self, max_workers=4):
+    def __init__(self, max_workers=12):
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
 
     async def extract_info_async(self, url: str, loop=None):
+        cached = _extract_cache.get(url)
+        if cached is not None:
+            return cached
+
         if loop is None:
             loop = asyncio.get_running_loop()
 
         def run_yt():
             with yt_dlp.YoutubeDL(YT_OPTS) as ydl:
+                return ydl.extract_info(url, download=False)
+
+        result = await loop.run_in_executor(self.executor, run_yt)
+
+        if result and 'url' in result:
+            _extract_cache[url] = result
+        return result
+
+    async def extract_info_flat_async(self, url: str, loop=None):
+        if loop is None:
+            loop = asyncio.get_running_loop()
+
+        def run_yt():
+            flat_opts = {
+                'quiet': True,
+                'no_warnings': True,
+                'extract_flat': True,
+                'ignoreerrors': True,
+            }
+            with yt_dlp.YoutubeDL(flat_opts) as ydl:
                 return ydl.extract_info(url, download=False)
 
         return await loop.run_in_executor(self.executor, run_yt)
@@ -271,6 +323,12 @@ class MusicCog(commands.Cog):
         self._progress_tasks = {}
         self.currently_playing = {}  # guild_id -> {song_data, started_at, elapsed, is_paused}
         self.guild_loops = {}  # guild_id -> 'off' | 'song' | 'queue'
+        self._play_next_locks = {}  # guild_id -> asyncio.Lock
+        self._now_playing_messages = {}  # guild_id -> discord.Message
+        self._timeout_cache = {}  # user_id -> timeout_data (in-memory, synced to disk on change)
+        self._load_timeouts()
+        self._playlist_cache_time = 0
+        self._playlist_cache_ttl = 3600  # 1 hour
 
     def make_embed(
         self,
@@ -290,9 +348,9 @@ class MusicCog(commands.Cog):
         if thumbnail:
             embed.set_thumbnail(url=thumbnail)
         if author_name:
-            embed.set_author(name=author_name, icon_url=author_icon or discord.Embed.Empty)
+            embed.set_author(name=author_name, icon_url=author_icon or "")
         if footer:
-            embed.set_footer(text=footer, icon_url=footer_icon or discord.Embed.Empty)
+            embed.set_footer(text=footer, icon_url=footer_icon or "")
         if fields:
             for name, value, inline in fields:
                 embed.add_field(name=name, value=value, inline=inline)
@@ -340,21 +398,13 @@ class MusicCog(commands.Cog):
 
             channel = await self.bot.fetch_channel(I_CHANNEL)
             if channel:
-                async for message in channel.history(limit=100):
-                    if (
-                        message.author == self.bot.user and
-                        message.embeds and
-                        message.embeds[0].title and
-                        "Marcante Musik" in message.embeds[0].title
-                    ):
-                        await message.delete()
-                    if (
-                        message.author == self.bot.user and
-                        message.embeds and
-                        message.embeds[0].title and
-                        "Music" in message.embeds[0].title
-                    ):
-                        await message.delete()
+                def check(msg):
+                    return (msg.author == self.bot.user and msg.embeds and msg.embeds[0].title and
+                            ("Marcante Musik" in msg.embeds[0].title or "Music" in msg.embeds[0].title))
+                try:
+                    await channel.purge(limit=100, check=check, bulk=True)
+                except discord.HTTPException:
+                    pass
 
                 await channel.send(embed=actions_embed, view=ActionsView(bot=self.bot))
         except Exception as e:
@@ -410,6 +460,17 @@ class MusicCog(commands.Cog):
                 return
 
             stream_url = fresh_info["url"]
+
+            if song_data.pop('_needs_full_extract', None):
+                song_data['title'] = fresh_info.get("title", "Unknown title")
+                song_data['thumbnail'] = fresh_info.get("thumbnail")
+                song_data['duration'] = fresh_info.get("duration", 0)
+                song_data['author'] = fresh_info.get("uploader") or fresh_info.get("creator") or fresh_info.get("artist") or "Unknown"
+                song_data['likes'] = fresh_info.get("like_count") or 0
+                song_data['views'] = fresh_info.get("view_count") or 0
+                song_data['upload_date'] = fresh_info.get("upload_date")
+                song_data['source'] = detect_source_from_entry(fresh_info)
+
             audio_source = await song_loader.preload_audio_source(stream_url)
         except Exception as e:
             logger.error(f"Retry {retry_count + 1} extract error: {e}")
@@ -461,354 +522,357 @@ class MusicCog(commands.Cog):
                     queue._loop_played.clear()
             queue.playing = False
 
+    async def _get_music_channel(self, interaction):
+        try:
+            ch = getattr(interaction, "channel", None)
+            if ch:
+                return ch
+        except Exception:
+            pass
+        return await self.bot.fetch_channel(I_CHANNEL)
+
     async def play_next(self, guild, voice_client, interaction):
         if guild.id not in guild_queues:
             return
 
-        queue = guild_queues[guild.id]
+        lock = self._play_next_locks.setdefault(guild.id, asyncio.Lock())
+        if lock.locked():
+            return
+        async with lock:
+            music_channel = await self._get_music_channel(interaction)
+            queue = guild_queues[guild.id]
 
-        async with queue.lock:
-            if voice_client.is_playing():
-                return
-
-            next_song_data = queue.get_next()
-
-        def after_song(e):
-            if e:
-                err_str = str(e).lower()
-                logger.error(f"Playback error: {e}")
-                # Detect 403 / HTTP errors and retry the current song
-                if any(code in err_str for code in ('403', 'forbidden', '401', 'unauthorized', '410', 'gone')):
-                    queue._last_playback_error = e
-                    asyncio.run_coroutine_threadsafe(
-                        self._retry_failed_song(guild, voice_client, interaction, next_song_data, retry_count=0),
-                        self.bot.loop
-                    )
+            async with queue.lock:
+                if voice_client.is_playing():
                     return
-            loop_mode = self.guild_loops.get(guild.id, 'off')
-            asyncio.run_coroutine_threadsafe(
-                self._handle_song_end(guild, queue, next_song_data, loop_mode),
-                self.bot.loop
-            )
-            pn = self.play_next(guild, voice_client, interaction)
-            asyncio.run_coroutine_threadsafe(pn, self.bot.loop)
 
-        if next_song_data:
-            try:
-                logger.info(f"Playing: {next_song_data.get('title', 'Unknown')} (duration: {next_song_data.get('duration', 0)}, views: {next_song_data.get('views', 0)}, likes: {next_song_data.get('likes', 0)})")
-                logger.info(f"Song URL: {next_song_data.get('song_url', 'Unknown')}")
-                
-                webpage_url = next_song_data['song_url']
-                
-                fresh_info = await song_loader.extract_info_async(webpage_url)
-                
-                if not fresh_info or "url" not in fresh_info:
-                    logger.warning(f"Failed to get fresh stream URL for {webpage_url}")
-                    try:
-                        await interaction.channel.send(
-                            embed=self.make_embed(
-                                title="⚠️ Stream unavailable",
-                                description=f"Could not load **{next_song_data.get('title', 'Unknown')}**.\nSkipping...",
-                                color=0xe67e22
-                            ),
-                            delete_after=10
+                next_song_data = queue.get_next()
+
+            def after_song(e):
+                if e:
+                    err_str = str(e).lower()
+                    logger.error(f"Playback error: {e}")
+                    if any(code in err_str for code in ('403', 'forbidden', '401', 'unauthorized', '410', 'gone')):
+                        queue._last_playback_error = e
+                        asyncio.run_coroutine_threadsafe(
+                            self._retry_failed_song(guild, voice_client, interaction, next_song_data, retry_count=0),
+                            self.bot.loop
                         )
-                    except Exception:
-                        pass
-                    queue.playing = False
-                    await self.play_next(guild, voice_client, interaction)
-                    return
-                
-                stream_url = fresh_info["url"]
-                
-                audio_source = await song_loader.preload_audio_source(stream_url)
-                
-            except Exception as e:
-                err = str(e)[:500]
-                logger.error(f"Error extracting stream: {err}")
-                queue.playing = False
+                        return
+                loop_mode = self.guild_loops.get(guild.id, 'off')
+                asyncio.run_coroutine_threadsafe(
+                    self._handle_song_end(guild, queue, next_song_data, loop_mode),
+                    self.bot.loop
+                )
+                pn = self.play_next(guild, voice_client, interaction)
+                asyncio.run_coroutine_threadsafe(pn, self.bot.loop)
+
+            if next_song_data:
                 try:
-                    await interaction.channel.send(
-                        embed=self.make_embed(
-                            title="❌ Stream extraction failed",
-                            description=f"Could not load **{next_song_data.get('title', 'Unknown')}**.\n```{err[:200]}```",
-                            color=0xe74c3c
-                        ),
-                        delete_after=12
-                    )
-                except Exception:
-                    pass
-                await self.play_next(guild, voice_client, interaction)
-                return
+                    logger.info(f"Playing: {next_song_data.get('title', 'Unknown')} (duration: {next_song_data.get('duration', 0)}, views: {next_song_data.get('views', 0)}, likes: {next_song_data.get('likes', 0)})")
+                    logger.info(f"Song URL: {next_song_data.get('song_url', 'Unknown')}")
+                    
+                    webpage_url = next_song_data['song_url']
 
-            queue.playing = True
-            self.songs_played += 1
+                    # Guard: rohe Stream-URL (videoplayback) ist unbrauchbar
+                    if 'googlevideo.com' in webpage_url or 'videoplayback' in webpage_url:
+                        rescued = (
+                            next_song_data.get('entry_data', {}).get('webpage_url')
+                            or next_song_data.get('entry_data', {}).get('original_url')
+                        )
+                        if rescued:
+                            logger.warning(f"Stream URL in song_url, rescued webpage_url: {rescued[:60]}")
+                            next_song_data['song_url'] = rescued
+                            webpage_url = rescued
+                        else:
+                            logger.warning(f"Stale stream URL, no rescue possible — skipping: {webpage_url[:80]}")
+                            queue.playing = False
+                            await self.play_next(guild, voice_client, interaction)
+                            return
 
-            volume = guild_volumes.get(guild.id, 1.0)
-            audio_source = discord.PCMVolumeTransformer(audio_source, volume=volume)
+                    preloaded = next_song_data.get('_preloaded_url')
+                    preload_age = time.time() - next_song_data.get('_preload_time', 0)
 
-            try:
-                voice_client.play(audio_source, after=after_song)
-            except Exception as e:
-                logger.error(f"Error starting playback: {e}")
-                queue.playing = False
-                try:
-                    await interaction.channel.send(
-                        embed=self.make_embed(
-                            title="❌ Playback start failed",
-                            description=f"Could not start playing **{next_song_data.get('title', 'Unknown')}**.\n```{str(e)[:200]}```",
-                            color=0xe74c3c
-                        ),
-                        delete_after=12
-                    )
-                except Exception:
-                    pass
-                await self.play_next(guild, voice_client, interaction)
-                return
+                    if preloaded and preload_age < 300:
+                        stream_url = preloaded
+                        next_song_data.pop('_needs_full_extract', None)
+                    else:
+                        fresh_info = await song_loader.extract_info_async(webpage_url)
 
-            self.currently_playing[guild.id] = {
-                'song_data': next_song_data,
-                'started_at': time.time(),
-                'elapsed': 0,
-                'is_paused': False,
-            }
-
-            metadata = (
-                next_song_data['title'],
-                next_song_data['thumbnail'],
-                None,
-                next_song_data['duration'],
-                next_song_data['author'],
-                next_song_data['song_url'],
-                next_song_data['likes'],
-                next_song_data['views'],
-                next_song_data['upload_date'],
-                next_song_data.get('source', {"label": "Unknown", "icon": "🔗", "extractor": None}),
-                next_song_data.get('requested_by_name'),
-                next_song_data.get('requested_by_id'),
-            )
-            
-            embed = self.create_now_playing_embed(metadata, interaction)
-            try:
-                # Delete old now-playing messages with buttons
-                channel = interaction.channel
-                async for msg in channel.history(limit=50):
-                    if msg.author == self.bot.user and msg.components:
-                        # Check if it has a Now Playing or Last Played embed
-                        if msg.embeds and any(
-                            emb.title in ["Now playing", "Last Played", "Now Playing"]
-                            for emb in msg.embeds
-                        ):
+                        if not fresh_info or "url" not in fresh_info:
+                            logger.warning(f"Failed to get fresh stream URL for {webpage_url}")
                             try:
-                                await msg.delete()
+                                await music_channel.send(
+                                    embed=self.make_embed(
+                                        title="⚠️ Stream unavailable",
+                                        description=f"Could not load **{next_song_data.get('title', 'Unknown')}**.\nSkipping...",
+                                        color=0xe67e22
+                                    ),
+                                    delete_after=10
+                                )
                             except Exception:
                                 pass
-                
-                # Send new message with action buttons
-                np_view = NowPlayingView(self, next_song_data['title'], next_song_data['author'])
-                msg = await interaction.channel.send(embed=embed, view=np_view)
-                self._schedule_progress(guild.id, msg, embed, next_song_data['duration'])
-            except Exception as e:
-                logger.error(f"Error sending now playing message: {e}")
+                            queue.playing = False
+                            await self.play_next(guild, voice_client, interaction)
+                            return
 
-            await self._set_song_activity(next_song_data['title'], next_song_data['author'])
-        elif AUTO_PLAY_ENABLED:
-            logger.info("autoplaying")
-            song_link = None
+                        stream_url = fresh_info["url"]
 
-            channel = getattr(interaction, "channel", None) or await self.bot.fetch_channel(I_CHANNEL)
-            try:
-                async for msg in channel.history(limit=200):
-                    if not msg.embeds:
-                        continue
-                    for emb in msg.embeds:
-                        candidates = []
-                        if getattr(emb, "url", None):
-                            candidates.append(emb.url)
-                        if getattr(emb, "title", None):
-                            candidates.append(emb.title)
-                        if getattr(emb, "description", None):
-                            candidates.append(emb.description)
-                        if getattr(emb, "fields", None):
-                            for f in emb.fields:
-                                candidates.append(f.name)
-                                candidates.append(f.value)
+                        if next_song_data.pop('_needs_full_extract', None):
+                            next_song_data['title'] = fresh_info.get("title", "Unknown title")
+                            next_song_data['thumbnail'] = fresh_info.get("thumbnail")
+                            next_song_data['duration'] = fresh_info.get("duration", 0)
+                            next_song_data['author'] = fresh_info.get("uploader") or fresh_info.get("creator") or fresh_info.get("artist") or "Unknown"
+                            next_song_data['likes'] = fresh_info.get("like_count") or 0
+                            next_song_data['views'] = fresh_info.get("view_count") or 0
+                            next_song_data['upload_date'] = fresh_info.get("upload_date")
+                            next_song_data['source'] = detect_source_from_entry(fresh_info)
 
-                        for text in candidates:
-                            if not text:
-                                continue
-                            m = AUTOPLAY_URL_RE.search(text)
-                            if m:
-                                candidate_url = m.group(1).rstrip(")")
-                                source_info = detect_source(candidate_url)
-                                if source_info["extractor"]:
-                                    song_link = candidate_url
-                                    break
-                        if song_link:
-                            break
-                    if song_link:
-                        break
-            except Exception as e:
-                logger.error(f"Error scanning history for embed song link: {e}")
-
-            if not song_link:
-                logger.warning("No song link found for autoplay")
-                queue.playing = False
-                return
-
-            source_type = detect_source(song_link)
-            is_youtube = source_type["extractor"] == "youtube"
-
-            if not is_youtube:
-                logger.warning(f"Autoplay: non-YouTube source ({source_type['label']}) — autoplay only supported for YouTube")
-                queue.playing = False
-                return
-
-            try:
-                video_id_match = re.search(r"(?:v=|youtu\.be/)([\w-]{11})", song_link)
-                if not video_id_match:
-                    logger.warning(f"Could not extract video ID from link: {song_link}")
+                    audio_source = await song_loader.preload_audio_source(stream_url)
+                    
+                except Exception as e:
+                    err = str(e)[:500]
+                    logger.error(f"Error extracting stream: {err}")
                     queue.playing = False
-                    return
-
-                video_id = video_id_match.group(1)
-
-                def _fetch_related():
-                    yt = YTMusic()
-                    return yt.get_song_related(video_id)
-
-                related_songs = await asyncio.get_running_loop().run_in_executor(
-                    song_loader.executor, _fetch_related
-                )
-
-                if not related_songs:
-                    logger.info("No related songs found")
-                    queue.playing = False
-                    return
-
-                suggestion = related_songs[0]["videoid"]
-                webpage_url = f"https://www.youtube.com/watch?v={suggestion}"
-            except Exception as e:
-                logger.error(f"Autoplay suggestion error: {e}")
-                queue.playing = False
-                return
-
-            try:
-                fresh_info = await song_loader.extract_info_async(webpage_url)
-
-                if not fresh_info or "url" not in fresh_info:
-                    logger.warning(f"Failed to get fresh stream URL for {webpage_url}")
                     try:
-                        await interaction.channel.send(
+                        await music_channel.send(
                             embed=self.make_embed(
-                                title="⚠️ Autoplay stream unavailable",
-                                description="Could not load the autoplay suggestion.\nSkipping...",
-                                color=0xe67e22
+                                title="❌ Stream extraction failed",
+                                description=f"Could not load **{next_song_data.get('title', 'Unknown')}**.\n```{err[:200]}```",
+                                color=0xe74c3c
                             ),
-                            delete_after=10
+                            delete_after=12
                         )
                     except Exception:
                         pass
-                    queue.playing = False
                     await self.play_next(guild, voice_client, interaction)
                     return
 
-                stream_url = fresh_info["url"]
-                audio_source = await song_loader.preload_audio_source(stream_url)
+                queue.playing = True
+                self.songs_played += 1
 
-            except Exception as e:
-                err = str(e)[:500]
-                logger.error(f"Autoplay extract error: {err}")
-                queue.playing = False
+                volume = guild_volumes.get(guild.id, 1.0)
+                audio_source = discord.PCMVolumeTransformer(audio_source, volume=volume)
+
                 try:
-                    await interaction.channel.send(
-                        embed=self.make_embed(
-                            title="⚠️ Autoplay error",
-                            description=f"Could not extract autoplay audio.\n```{err[:200]}```",
-                            color=0xe74c3c
-                        ),
-                        delete_after=10
-                    )
-                except Exception:
-                    pass
-                await self.play_next(guild, voice_client, interaction)
-                return
+                    voice_client.play(audio_source, after=after_song)
+                except Exception as e:
+                    logger.error(f"Error starting playback: {e}")
+                    queue.playing = False
+                    try:
+                        await music_channel.send(
+                            embed=self.make_embed(
+                                title="❌ Playback start failed",
+                                description=f"Could not start playing **{next_song_data.get('title', 'Unknown')}**.\n```{str(e)[:200]}```",
+                                color=0xe74c3c
+                            ),
+                            delete_after=12
+                        )
+                    except Exception:
+                        pass
+                    await self.play_next(guild, voice_client, interaction)
+                    return
 
-            queue.playing = True
-            self.songs_played += 1
+                self.create_background_task(self._preload_next(guild.id))
 
-            volume = guild_volumes.get(guild.id, 1.0)
-            audio_source = discord.PCMVolumeTransformer(audio_source, volume=volume)
-
-            try:
-                voice_client.play(audio_source, after=after_song)
-            except Exception as e:
-                logger.error(f"Error starting autoplay playback: {e}")
-                queue.playing = False
-                try:
-                    await interaction.channel.send(
-                        embed=self.make_embed(
-                            title="❌ Autoplay failed",
-                            description=f"Could not start autoplay.\n```{str(e)[:200]}```",
-                            color=0xe74c3c
-                        ),
-                        delete_after=10
-                    )
-                except Exception:
-                    pass
-                return
-
-            processed = await self.process_single_entry(fresh_info, requester=interaction.user)
-            if processed:
                 self.currently_playing[guild.id] = {
-                    'song_data': processed,
+                    'song_data': next_song_data,
                     'started_at': time.time(),
                     'elapsed': 0,
                     'is_paused': False,
                 }
-                embed = self.create_now_playing_embed((
-                    processed['title'],
-                    processed['thumbnail'],
+
+                metadata = (
+                    next_song_data['title'],
+                    next_song_data['thumbnail'],
                     None,
-                    processed['duration'],
-                    processed['author'],
-                    processed['song_url'],
-                    processed['likes'],
-                    processed['views'],
-                    processed['upload_date'],
-                    processed['source'],
-                    processed.get('requested_by_name'),
-                    processed.get('requested_by_id'),
-                ), interaction)
+                    next_song_data['duration'],
+                    next_song_data['author'],
+                    next_song_data['song_url'],
+                    next_song_data['likes'],
+                    next_song_data['views'],
+                    next_song_data['upload_date'],
+                    next_song_data.get('source', {"label": "Unknown", "icon": "🔗", "extractor": None}),
+                    next_song_data.get('requested_by_name'),
+                    next_song_data.get('requested_by_id'),
+                )
+                
+                embed = self.create_now_playing_embed(metadata, interaction)
                 try:
-                    # Delete old now-playing messages with buttons
-                    channel = interaction.channel
-                    async for msg in channel.history(limit=50):
-                        if msg.author == self.bot.user and msg.components:
-                            # Check if it has a Now Playing or Last Played embed
-                            if msg.embeds and any(
-                                emb.title in ["Now playing", "Last Played", "Now Playing"]
-                                for emb in msg.embeds
-                            ):
-                                try:
-                                    await msg.delete()
-                                except Exception:
-                                    pass
-                    
-                    # Send new message with action buttons
-                    np_view = NowPlayingView(self, processed['title'], processed['author'])
-                    msg = await interaction.channel.send(embed=embed, view=np_view)
-                    self._schedule_progress(guild.id, msg, embed, processed['duration'])
+                    old_msg = self._now_playing_messages.get(guild.id)
+                    if old_msg:
+                        try:
+                            await old_msg.delete()
+                        except Exception:
+                            pass
+
+                    np_view = NowPlayingView(self, next_song_data['title'], next_song_data['author'])
+                    msg = await music_channel.send(embed=embed, view=np_view)
+                    self._now_playing_messages[guild.id] = msg
+                    self._schedule_progress(guild.id, msg, embed, next_song_data['duration'])
                 except Exception as e:
                     logger.error(f"Error sending now playing message: {e}")
 
-                await self._set_song_activity(processed['title'], processed['author'])
+                await self._set_song_activity(next_song_data['title'], next_song_data['author'])
+            elif AUTO_PLAY_ENABLED:
+                logger.info("autoplaying")
 
-        else:
-            logger.info("queue stopped")
-            queue.playing = False
-            self.currently_playing.pop(guild.id, None)
-            await self._reset_activity()
+                current = self.currently_playing.get(guild.id)
+                song_link = current.get('song_data', {}).get('song_url') if current else None
+
+                if not song_link:
+                    logger.warning("No song link found for autoplay")
+                    queue.playing = False
+                    return
+
+                source_type = detect_source(song_link)
+                is_youtube = source_type["extractor"] == "youtube"
+
+                if not is_youtube:
+                    logger.warning(f"Autoplay: non-YouTube source ({source_type['label']}) — autoplay only supported for YouTube")
+                    queue.playing = False
+                    return
+
+                try:
+                    video_id_match = re.search(r"(?:v=|youtu\.be/)([\w-]{11})", song_link)
+                    if not video_id_match:
+                        logger.warning(f"Could not extract video ID from link: {song_link}")
+                        queue.playing = False
+                        return
+
+                    video_id = video_id_match.group(1)
+
+                    def _fetch_related():
+                        yt = YTMusic()
+                        return yt.get_song_related(video_id)
+
+                    related_songs = await asyncio.get_running_loop().run_in_executor(
+                        song_loader.executor, _fetch_related
+                    )
+
+                    if not related_songs:
+                        logger.info("No related songs found")
+                        queue.playing = False
+                        return
+
+                    suggestion = related_songs[0]["videoid"]
+                    webpage_url = f"https://www.youtube.com/watch?v={suggestion}"
+                except Exception as e:
+                    logger.error(f"Autoplay suggestion error: {e}")
+                    queue.playing = False
+                    return
+
+                try:
+                    fresh_info = await song_loader.extract_info_async(webpage_url)
+
+                    if not fresh_info or "url" not in fresh_info:
+                        logger.warning(f"Failed to get fresh stream URL for {webpage_url}")
+                        try:
+                            await music_channel.send(
+                                embed=self.make_embed(
+                                    title="⚠️ Autoplay stream unavailable",
+                                    description="Could not load the autoplay suggestion.\nSkipping...",
+                                    color=0xe67e22
+                                ),
+                                delete_after=10
+                            )
+                        except Exception:
+                            pass
+                        queue.playing = False
+                        await self.play_next(guild, voice_client, interaction)
+                        return
+
+                    stream_url = fresh_info["url"]
+                    audio_source = await song_loader.preload_audio_source(stream_url)
+
+                except Exception as e:
+                    err = str(e)[:500]
+                    logger.error(f"Autoplay extract error: {err}")
+                    queue.playing = False
+                    try:
+                        await music_channel.send(
+                            embed=self.make_embed(
+                                title="⚠️ Autoplay error",
+                                description=f"Could not extract autoplay audio.\n```{err[:200]}```",
+                                color=0xe74c3c
+                            ),
+                            delete_after=10
+                        )
+                    except Exception:
+                        pass
+                    await self.play_next(guild, voice_client, interaction)
+                    return
+
+                queue.playing = True
+                self.songs_played += 1
+
+                volume = guild_volumes.get(guild.id, 1.0)
+                audio_source = discord.PCMVolumeTransformer(audio_source, volume=volume)
+
+                try:
+                    voice_client.play(audio_source, after=after_song)
+                except Exception as e:
+                    logger.error(f"Error starting autoplay playback: {e}")
+                    queue.playing = False
+                    try:
+                        await music_channel.send(
+                            embed=self.make_embed(
+                                title="❌ Autoplay failed",
+                                description=f"Could not start autoplay.\n```{str(e)[:200]}```",
+                                color=0xe74c3c
+                            ),
+                            delete_after=10
+                        )
+                    except Exception:
+                        pass
+                    return
+
+                self.create_background_task(self._preload_next(guild.id))
+
+                processed = await self.process_single_entry(fresh_info, requester=interaction.user)
+                if processed:
+                    self.currently_playing[guild.id] = {
+                        'song_data': processed,
+                        'started_at': time.time(),
+                        'elapsed': 0,
+                        'is_paused': False,
+                    }
+                    embed = self.create_now_playing_embed((
+                        processed['title'],
+                        processed['thumbnail'],
+                        None,
+                        processed['duration'],
+                        processed['author'],
+                        processed['song_url'],
+                        processed['likes'],
+                        processed['views'],
+                        processed['upload_date'],
+                        processed['source'],
+                        processed.get('requested_by_name'),
+                        processed.get('requested_by_id'),
+                    ), interaction)
+                    try:
+                        old_msg = self._now_playing_messages.get(guild.id)
+                        if old_msg:
+                            try:
+                                await old_msg.delete()
+                            except Exception:
+                                pass
+
+                        np_view = NowPlayingView(self, processed['title'], processed['author'])
+                        msg = await music_channel.send(embed=embed, view=np_view)
+                        self._now_playing_messages[guild.id] = msg
+                        self._schedule_progress(guild.id, msg, embed, processed['duration'])
+                    except Exception as e:
+                        logger.error(f"Error sending now playing message: {e}")
+
+                    await self._set_song_activity(processed['title'], processed['author'])
+
+            else:
+                logger.info("queue stopped")
+                queue.playing = False
+                self.currently_playing.pop(guild.id, None)
+                await self._reset_activity()
 
     def create_now_playing_embed(self, metadata, interaction):
         title, thumbnail, _, duration, author, song_url, likes, views, upload_date, source, req_name, req_id = metadata
@@ -910,6 +974,17 @@ class MusicCog(commands.Cog):
 
     async def _search_and_play(self, interaction: discord.Interaction, search_term: str, color: int = 0x3498db, loading_message: discord.WebhookMessage = None):
         """Shared helper: search a song, add to queue, and start playback."""
+        if not interaction.user.voice:
+            await interaction.followup.send(
+                embed=self.make_embed(
+                    title="Voice channel required",
+                    description="Join a voice channel and try again.",
+                    color=0xe74c3c
+                ),
+                ephemeral=True
+            )
+            return
+
         search_query = f"ytsearch:{search_term}"
 
         try:
@@ -954,17 +1029,6 @@ class MusicCog(commands.Cog):
             else:
                 await interaction.channel.send(embed=success_embed)
 
-        if not interaction.user.voice:
-            await interaction.followup.send(
-                embed=self.make_embed(
-                    title="Voice channel required",
-                    description="Join a voice channel and try again.",
-                    color=0xe74c3c
-                ),
-                ephemeral=True
-            )
-            return
-
         voice_client = await self._ensure_voice(interaction, queue)
         await self._maybe_play(voice_client, queue, interaction)
 
@@ -989,17 +1053,30 @@ class MusicCog(commands.Cog):
         m, s = divmod(int(seconds), 60)
         return f"{m:02}:{s:02}"
 
-    async def process_single_entry(self, entry: dict, requester: Optional[discord.abc.User] = None, original_source: Optional[str] = None):
+    async def process_single_entry(self, entry: dict, requester: Optional[discord.abc.User] = None, original_source: Optional[str] = None, flat: bool = False):
         try:
-            if not entry or "url" not in entry:
-                logger.error(f"Error processing entry: Missing 'url' key")
+            if not entry or ("url" not in entry and "webpage_url" not in entry):
+                logger.error(f"Error processing entry: Missing 'url' or 'webpage_url' key")
                 return None
 
+            song_url = entry.get("webpage_url") or entry.get("original_url") or entry.get("url") or "Unknown URL"
             source = detect_source_from_entry(entry)
             if original_source:
                 override = self._resolve_source_for_url("", original_source)
                 if override:
                     source = override
+
+            if flat:
+                return {
+                    'entry_data': entry,
+                    'title': entry.get("title", "Unknown title"),
+                    'song_url': song_url,
+                    'source': source,
+                    'original_source': original_source or source.get("label"),
+                    'requested_by_id': requester.id if requester else 0,
+                    'requested_by_name': requester.display_name if requester else "Unknown",
+                    '_needs_full_extract': True,
+                }
 
             return {
                 'entry_data': entry,
@@ -1007,7 +1084,7 @@ class MusicCog(commands.Cog):
                 'thumbnail': entry.get("thumbnail"),
                 'duration': entry.get("duration", 0),
                 'author': entry.get("uploader") or entry.get("creator") or entry.get("artist") or "Unknown",
-                'song_url': entry.get("webpage_url") or entry.get("original_url") or "Unknown URL",
+                'song_url': song_url,
                 'likes': entry.get("like_count") or 0,
                 'views': entry.get("view_count") or 0,
                 'upload_date': entry.get("upload_date"),
@@ -1021,7 +1098,73 @@ class MusicCog(commands.Cog):
             logger.error(f"Error processing entry: {e}")
             return None
 
-    async def process_song_entries(self, entries: List[dict], guild_id: int, requester: Optional[discord.abc.User] = None, original_source: Optional[str] = None):
+    async def _load_and_process_url(self, url: str, requester: Optional[discord.abc.User] = None) -> Optional[dict]:
+        try:
+            if needs_resolution(url):
+                url = await resolve_to_direct_url(url) or url
+            info = await song_loader.extract_info_async(url)
+            if not info:
+                return None
+            song_data = info["entries"][0] if "entries" in info and info.get("entries") else info
+            return await self.process_single_entry(song_data, requester=requester)
+        except Exception as e:
+            logger.error(f"Failed to load track {url}: {e}")
+            return None
+
+    async def _quick_add_song(self, url: str, requester: Optional[discord.abc.User] = None) -> Optional[dict]:
+        try:
+            if needs_resolution(url):
+                url = await resolve_to_direct_url(url) or url
+            if not url:
+                return None
+
+            # Kein yt-dlp-Call — URL direkt als Stub in die Queue.
+            # play_next / _preload_next extrahieren Metadaten kurz vor dem Abspielen.
+            source = detect_source(url)
+            return {
+                'title': 'Loading...',
+                'song_url': url,
+                'thumbnail': None,
+                'duration': 0,
+                'author': 'Unknown',
+                'likes': 0,
+                'views': 0,
+                'upload_date': None,
+                'source': source,
+                'original_source': source.get("label"),
+                'requested_by_id': requester.id if requester else 0,
+                'requested_by_name': requester.display_name if requester else "Unknown",
+                '_needs_full_extract': True,
+            }
+        except Exception as e:
+            logger.error(f"Failed to quick-add track {url}: {e}")
+            return None
+
+    async def _preload_next(self, guild_id: int):
+        queue = guild_queues.get(guild_id)
+        if not queue:
+            return
+        next_song = queue.peek()
+        if not next_song or next_song.get('_preloaded_url'):
+            return
+        try:
+            info = await song_loader.extract_info_async(next_song['song_url'])
+            if info and 'url' in info:
+                next_song['_preloaded_url'] = info['url']
+                next_song['_preload_time'] = time.time()
+                if next_song.pop('_needs_full_extract', None):
+                    next_song['title'] = info.get("title", "Unknown title")
+                    next_song['thumbnail'] = info.get("thumbnail")
+                    next_song['duration'] = info.get("duration", 0)
+                    next_song['author'] = info.get("uploader") or info.get("creator") or info.get("artist") or "Unknown"
+                    next_song['likes'] = info.get("like_count") or 0
+                    next_song['views'] = info.get("view_count") or 0
+                    next_song['upload_date'] = info.get("upload_date")
+                    next_song['source'] = detect_source_from_entry(info)
+        except Exception:
+            pass
+
+    async def process_song_entries(self, entries: List[dict], guild_id: int, requester: Optional[discord.abc.User] = None, original_source: Optional[str] = None, flat: bool = False):
         if guild_id not in guild_queues:
             guild_queues[guild_id] = OptimizedQueue()
 
@@ -1036,7 +1179,7 @@ class MusicCog(commands.Cog):
             tasks = []
             for entry in batch:
                 if entry:
-                    tasks.append(self.process_single_entry(entry, requester, original_source))
+                    tasks.append(self.process_single_entry(entry, requester, original_source, flat=flat))
 
             if tasks:
                 results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -1110,9 +1253,9 @@ class MusicCog(commands.Cog):
             if not trending_songs:
                 try:
                     search_queries = [
-                        "ytsearch5:music charts 2024",
+                        f"ytsearch5:music charts {datetime.now().year}",
                         "ytsearch5:trending music now",
-                        "ytsearch5:top songs 2024"
+                        f"ytsearch5:top songs {datetime.now().year}"
                     ]
 
                     for search_query in search_queries:
@@ -1190,6 +1333,13 @@ class MusicCog(commands.Cog):
                 return ydl.extract_info(self.RANDOM_PLAYLIST_URL, download=False)
         return await loop.run_in_executor(song_loader.executor, run)
 
+    async def _ensure_playlist_cache(self):
+        now = time.time()
+        if not hasattr(self, '_playlist_cache') or not self._playlist_cache or now - self._playlist_cache_time > self._playlist_cache_ttl:
+            info = await self._fetch_playlist()
+            self._playlist_cache = [e for e in info.get("entries", []) if e.get("title") and e.get("url")]
+            self._playlist_cache_time = now
+
     async def inspire_me(self, interaction: discord.Interaction):
         if await self.check_timeout_decorator(interaction):
             return
@@ -1207,9 +1357,7 @@ class MusicCog(commands.Cog):
             return
 
         try:
-            if not hasattr(self, '_playlist_cache') or not self._playlist_cache:
-                info = await self._fetch_playlist()
-                self._playlist_cache = [e for e in info.get("entries", []) if e.get("title") and e.get("url")]
+            await self._ensure_playlist_cache()
 
             if not self._playlist_cache:
                 raise Exception("No songs found in playlist")
@@ -1272,9 +1420,7 @@ class MusicCog(commands.Cog):
             return
 
         try:
-            if not hasattr(self, '_playlist_cache') or not self._playlist_cache:
-                info = await self._fetch_playlist()
-                self._playlist_cache = [e for e in info.get("entries", []) if e.get("title") and e.get("url")]
+            await self._ensure_playlist_cache()
 
             if not self._playlist_cache:
                 raise Exception("No songs found in playlist")
@@ -1293,19 +1439,19 @@ class MusicCog(commands.Cog):
                 guild_queues[interaction.guild.id] = OptimizedQueue()
             queue = guild_queues[interaction.guild.id]
 
-            async def _extract(entry):
+            async def _extract_flat(entry):
                 try:
-                    info = await song_loader.extract_info_async(entry["url"])
+                    info = await song_loader.extract_info_flat_async(entry["url"])
                     if info and not ("entries" in info and not [e for e in info["entries"] if e]):
                         return info["entries"][0] if "entries" in info else info
                 except Exception:
                     pass
                 return None
 
-            tasks = [_extract(e) for e in shuffled]
-            full_entries = [e for e in await asyncio.gather(*tasks) if e]
+            tasks = [_extract_flat(e) for e in shuffled]
+            flat_entries = [e for e in await asyncio.gather(*tasks) if e]
 
-            if not full_entries:
+            if not flat_entries:
                 await loading.edit(embed=self.make_embed(
                     title="Error",
                     description="Could not load any songs from playlist.",
@@ -1313,7 +1459,7 @@ class MusicCog(commands.Cog):
                 ))
                 return
 
-            processed, skipped = await self.process_song_entries(full_entries, interaction.guild.id, requester=interaction.user)
+            processed, skipped = await self.process_song_entries(flat_entries, interaction.guild.id, requester=interaction.user, flat=True)
 
             titles_list = "\n".join([f"- {s['title']}" for s in processed[:10]])
             if len(processed) > 10:
@@ -1327,7 +1473,6 @@ class MusicCog(commands.Cog):
                 title="🎲 Playlist Shuffle",
                 description=f"{desc}\n\n{titles_list}",
                 color=0x2ecc71,
-                thumbnail=processed[0]['thumbnail'] if processed else None,
                 fields=[
                     ("Position", f"```\n#{len(queue.queue) - len(processed) + 1}\n```", True),
                 ]
@@ -1371,7 +1516,7 @@ class MusicCog(commands.Cog):
         else:
             try:
                 await interaction.response.defer()
-            except:
+            except Exception:
                 pass
 
         if interaction.guild.id not in guild_queues:
@@ -1436,9 +1581,19 @@ class MusicCog(commands.Cog):
         info = None
         err_msg = None
         source_hint = detect_source(song)["label"] if is_url else (source.capitalize() if source != "auto" else "YouTube")
+        is_flat_playlist = False
 
         try:
-            info = await song_loader.extract_info_async(search_query)
+            if is_url and bool(YT_PLAYLIST_RE.search(song)):
+                info = await song_loader.extract_info_flat_async(search_query)
+                if info and "entries" in info and [e for e in info["entries"] if e]:
+                    is_flat_playlist = True
+                elif info and not ("entries" in info):
+                    pass  # Single result — use as-is, play_next fills metadata
+                else:
+                    info = None
+            else:
+                info = await song_loader.extract_info_async(search_query)
         except Exception as e:
             err_msg = str(e)[:1500]
 
@@ -1547,14 +1702,14 @@ class MusicCog(commands.Cog):
                 color=0xf39c12
             ))
 
-            processed_songs, skipped = await self.process_song_entries(entries, interaction.guild.id, requester=interaction.user, original_source=original_source_name)
+            processed_songs, skipped = await self.process_song_entries(entries, interaction.guild.id, requester=interaction.user, original_source=original_source_name, flat=is_flat_playlist)
 
             titles_list = "\n".join([f"- {song['title']}" for song in processed_songs[:10]])
             if len(processed_songs) > 10:
                 titles_list += f"\n\n...and {len(processed_songs) - 10} more."
 
             initial_len = max(0, len(queue.queue) - len(processed_songs))
-            wait_seconds = sum(song['duration'] for song in queue.queue[:initial_len]) if initial_len > 0 else 0
+            wait_seconds = sum(song.get('duration', 0) or 0 for song in list(queue.queue)[:initial_len]) if initial_len > 0 else 0
 
             first_source = detect_source_from_entry(entries[0]) if entries else detect_source(song)
             if original_source_name:
@@ -1567,16 +1722,19 @@ class MusicCog(commands.Cog):
             if skipped > 0:
                 desc += f"\n⚠️ {skipped} song{'s' if skipped != 1 else ''} skipped (unavailable)."
 
+            embed_fields = [
+                ("Platform", f"```\n{first_source['label']}\n```", True),
+                ("Position", f"```\n#{initial_len + 1}\n```", True),
+            ]
+            if wait_seconds > 0:
+                embed_fields.append(("Estimated time", f"```\n{self.format_time(wait_seconds)}\n```", True))
+
             await loading_message.edit(embed=self.make_embed(
                 title=f"{source_icon} Playlist added",
                 description=f"{desc}\n\n{titles_list}",
                 color=0x2ecc71,
                 thumbnail=(entries[0].get("thumbnail") if entries else None),
-                fields=[
-                    ("Platform", f"```\n{first_source['label']}\n```", True),
-                    ("Position", f"```\n#{initial_len + 1}\n```", True),
-                    ("Estimated time", f"```\n{self.format_time(wait_seconds)}\n```", True),
-                ]
+                fields=embed_fields,
             ))
 
         else:
@@ -1774,14 +1932,15 @@ class MusicCog(commands.Cog):
             ]
         )
 
-        if i.guild.voice_client:
-            voice_channel = voice_client.channel
+        vc = i.guild.voice_client
+        if vc:
             try:
-                await voice_channel.edit(status=None)
+                await vc.channel.edit(status=None)
             except Exception:
                 pass
-            await i.guild.voice_client.disconnect()
+            await vc.disconnect()
             self.currently_playing.pop(i.guild.id, None)
+            self._now_playing_messages.pop(i.guild.id, None)
             await self._reset_activity()
             await i.response.send_message(embed=embed)
             await self.send_static_message()
@@ -1820,21 +1979,22 @@ class MusicCog(commands.Cog):
         queue = guild_queues[interaction.guild.id]
 
         if not queue.queue:
-            if not hasattr(self, '_playlist_cache') or not self._playlist_cache:
-                info = await self._fetch_playlist()
-                self._playlist_cache = [e for e in info.get("entries", []) if e.get("title") and e.get("url")]
+            await self._ensure_playlist_cache()
 
             added = 0
-            for entry in random.sample(self._playlist_cache, min(10, len(self._playlist_cache))):
+            sample = random.sample(self._playlist_cache, min(10, len(self._playlist_cache)))
+            async def _load_entry(entry):
                 try:
                     info = await song_loader.extract_info_async(entry["url"])
                     song_data = info["entries"][0] if "entries" in info and info["entries"] else info
-                    processed = await self.process_single_entry(song_data, requester=interaction.user)
-                    if processed:
-                        queue.add(processed)
-                        added += 1
+                    return await self.process_single_entry(song_data, requester=interaction.user)
                 except Exception:
-                    pass
+                    return None
+            results = await asyncio.gather(*[_load_entry(e) for e in sample])
+            for processed in results:
+                if processed:
+                    queue.add(processed)
+                    added += 1
 
             if not added:
                 await interaction.followup.send(
@@ -1957,10 +2117,12 @@ class MusicCog(commands.Cog):
             guild_id = before.channel.guild.id
             if guild_id in guild_queues:
                 queue = guild_queues[guild_id]
-                queue.clear()
-                queue.playing = False
-                del guild_queues[guild_id]
+                async with queue.lock:
+                    queue.clear()
+                    queue.playing = False
+                    del guild_queues[guild_id]
             self.currently_playing.pop(guild_id, None)
+            self._now_playing_messages.pop(guild_id, None)
             
             self.create_background_task(self._delayed_cleanup_task(guild_id))
             return
@@ -1982,10 +2144,12 @@ class MusicCog(commands.Cog):
                             guild_id = before.channel.guild.id
                             queue = guild_queues.get(guild_id)
                             if queue:
-                                queue.clear()
-                                queue.playing = False
-                                del guild_queues[guild_id]
+                                async with queue.lock:
+                                    queue.clear()
+                                    queue.playing = False
+                                    del guild_queues[guild_id]
                             self.currently_playing.pop(guild_id, None)
+                            self._now_playing_messages.pop(guild_id, None)
                             voice_channel = voice_client.channel
                             try:
                                 await voice_channel.edit(status=None)
@@ -2021,42 +2185,20 @@ class MusicCog(commands.Cog):
             )
             return
 
-        timeout_file = "timeouts.json"
-        timeouts = {}
+        end_time = datetime.now(timezone.utc) + timedelta(minutes=duration)
 
-        if os.path.exists(timeout_file):
-            try:
-                with open(timeout_file, 'r') as f:
-                    timeouts = json.load(f)
-            except json.JSONDecodeError:
-                timeouts = {}
-
-        end_time = datetime.now() + timedelta(minutes=duration)
-
-        timeouts[str(user.id)] = {
+        self._timeout_cache[user.id] = {
             "user_id": user.id,
             "username": user.display_name,
             "timeout_by": interaction.user.id,
             "timeout_by_name": interaction.user.display_name,
-            "start_time": datetime.now().isoformat(),
+            "start_time": datetime.now(timezone.utc).isoformat(),
             "end_time": end_time.isoformat(),
             "duration_minutes": duration,
             "guild_id": interaction.guild.id
         }
 
-        try:
-            with open(timeout_file, 'w') as f:
-                json.dump(timeouts, f, indent=2)
-        except Exception as e:
-            await interaction.response.send_message(
-                embed=self.make_embed(
-                    title="Error",
-                    description=f"Failed to save timeout data.\n\n{e}",
-                    color=0xe74c3c
-                ),
-                ephemeral=True
-            )
-            return
+        self._save_timeouts()
 
         embed = self.make_embed(
             title="User timed out",
@@ -2072,65 +2214,51 @@ class MusicCog(commands.Cog):
 
         await interaction.response.send_message(embed=embed, ephemeral=True, delete_after=10, silent=True)
 
-    def cleanup_expired_timeouts(self):
+    def _load_timeouts(self):
         timeout_file = "timeouts.json"
-
         if not os.path.exists(timeout_file):
+            self._timeout_cache = {}
             return
-
         try:
             with open(timeout_file, 'r') as f:
-                timeouts = json.load(f)
+                self._timeout_cache = {int(k): v for k, v in json.load(f).items()}
         except (json.JSONDecodeError, FileNotFoundError):
-            return
+            self._timeout_cache = {}
 
-        current_time = datetime.now()
-        expired_users = []
+    def _save_timeouts(self):
+        timeout_file = "timeouts.json"
+        try:
+            with open(timeout_file, 'w') as f:
+                json.dump({str(k): v for k, v in self._timeout_cache.items()}, f, indent=2)
+        except Exception as e:
+            logger.error(f"Error saving timeout file: {e}")
 
-        for user_id, timeout_data in list(timeouts.items()):
-            end_time = datetime.fromisoformat(timeout_data["end_time"])
-            if current_time > end_time:
-                expired_users.append(user_id)
-
-        for user_id in expired_users:
-            del timeouts[user_id]
-
-        if expired_users:
-            try:
-                with open(timeout_file, 'w') as f:
-                    json.dump(timeouts, f, indent=2)
-            except Exception as e:
-                logger.error(f"Error updating timeout file: {e}")
+    def cleanup_expired_timeouts(self):
+        current_time = datetime.now(timezone.utc)
+        expired = [uid for uid, data in self._timeout_cache.items()
+                   if datetime.fromisoformat(data["end_time"]) <= current_time]
+        for uid in expired:
+            del self._timeout_cache[uid]
+        if expired:
+            self._save_timeouts()
 
     def is_user_timed_out(self, user_id: int) -> Optional[dict]:
         self.cleanup_expired_timeouts()
-        timeout_file = "timeouts.json"
-        if not os.path.exists(timeout_file):
+        data = self._timeout_cache.get(user_id)
+        if not data:
             return None
-        try:
-            with open(timeout_file, 'r') as f:
-                timeouts = json.load(f)
-        except (json.JSONDecodeError, FileNotFoundError):
+        end_time = datetime.fromisoformat(data["end_time"])
+        if datetime.now(timezone.utc) > end_time:
+            del self._timeout_cache[user_id]
+            self._save_timeouts()
             return None
-        user_key = str(user_id)
-        if user_key not in timeouts:
-            return None
-        end_time = datetime.fromisoformat(timeouts[user_key]["end_time"])
-        if datetime.now() > end_time:
-            del timeouts[user_key]
-            try:
-                with open(timeout_file, 'w') as f:
-                    json.dump(timeouts, f, indent=2)
-            except Exception:
-                pass
-            return None
-        return timeouts[user_key]
+        return data
 
     async def check_timeout_decorator(self, interaction: discord.Interaction):
         timeout_data = self.is_user_timed_out(interaction.user.id)
         if timeout_data:
             end_time = datetime.fromisoformat(timeout_data["end_time"])
-            remaining_minutes = max(0, int((end_time - datetime.now()).total_seconds() / 60))
+            remaining_minutes = max(0, int((end_time - datetime.now(timezone.utc)).total_seconds() / 60))
             embed = self.make_embed(
                 title="Muted",
                 description="You cannot use music commands right now.",
@@ -2159,27 +2287,7 @@ class MusicCog(commands.Cog):
             )
             return
 
-        timeout_file = "timeouts.json"
-
-        if not os.path.exists(timeout_file):
-            await interaction.response.send_message(
-                embed=self.make_embed(
-                    title="No timeouts",
-                    description="No timeout data found.",
-                    color=0xe74c3c
-                ),
-                ephemeral=True
-            )
-            return
-
-        try:
-            with open(timeout_file, 'r') as f:
-                timeouts = json.load(f)
-        except json.JSONDecodeError:
-            timeouts = {}
-
-        user_key = str(user.id)
-        if user_key not in timeouts:
+        if user.id not in self._timeout_cache:
             await interaction.response.send_message(
                 embed=self.make_embed(
                     title="Not muted",
@@ -2190,21 +2298,8 @@ class MusicCog(commands.Cog):
             )
             return
 
-        del timeouts[user_key]
-
-        try:
-            with open(timeout_file, 'w') as f:
-                json.dump(timeouts, f, indent=2)
-        except Exception as e:
-            await interaction.response.send_message(
-                embed=self.make_embed(
-                    title="Error",
-                    description=f"Failed to save timeout data.\n\n{e}",
-                    color=0xe74c3c
-                ),
-                ephemeral=True
-            )
-            return
+        del self._timeout_cache[user.id]
+        self._save_timeouts()
 
         embed = self.make_embed(
             title="Timeout removed",
@@ -2232,9 +2327,8 @@ class MusicCog(commands.Cog):
             return
 
         self.cleanup_expired_timeouts()
-        timeout_file = "timeouts.json"
 
-        if not os.path.exists(timeout_file):
+        if not self._timeout_cache:
             await interaction.response.send_message(
                 embed=self.make_embed(
                     title="No mutes",
@@ -2245,14 +2339,8 @@ class MusicCog(commands.Cog):
             )
             return
 
-        try:
-            with open(timeout_file, 'r') as f:
-                all_timeouts = json.load(f)
-        except (json.JSONDecodeError, FileNotFoundError):
-            all_timeouts = {}
-
         guild_mutes = [
-            data for data in all_timeouts.values()
+            data for data in self._timeout_cache.values()
             if data.get("guild_id") == interaction.guild.id
         ]
 
@@ -2809,14 +2897,17 @@ class MusicCog(commands.Cog):
             )
             return
 
+        await interaction.response.defer()
+
         was_paused = voice_client.is_paused()
-        voice_client.stop()
 
         try:
+            voice_client.stop()
+
             fresh_info = await song_loader.extract_info_async(webpage_url)
             stream_url = fresh_info.get('url')
             if not stream_url:
-                await interaction.response.send_message(
+                await interaction.followup.send(
                     embed=self.make_embed(title="Error", description="Could not get stream URL.", color=0xe74c3c),
                     ephemeral=True
                 )
@@ -2871,7 +2962,7 @@ class MusicCog(commands.Cog):
 
             seek_pos = self.format_time(seconds)
             seek_total = self.format_time(duration)
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 embed=self.make_embed(
                     title="Seeked",
                     description=f"Jumped to `{seek_pos}` / `{seek_total}`",
@@ -2883,7 +2974,7 @@ class MusicCog(commands.Cog):
 
         except Exception as e:
             logger.error(f"Seek error: {e}")
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 embed=self.make_embed(title="Error", description=f"Could not seek.\n\n{e}", color=0xe74c3c),
                 ephemeral=True
             )
@@ -2951,11 +3042,8 @@ class MusicCog(commands.Cog):
             )
             return
 
-        removed = list(queue.queue)
-        removed_song = removed.pop(position - 1)
-        queue.queue.clear()
-        for s in removed:
-            queue.queue.append(s)
+        removed_song = queue.queue[position - 1]
+        del queue.queue[position - 1]
 
         await interaction.response.send_message(
             embed=self.make_embed(
@@ -3004,7 +3092,7 @@ class MusicCog(commands.Cog):
                 await interaction.followup.send(f"Could not extract song data from URL: **{url}**")
                 return
             title = song_data.get("title", "Unknown")
-            song_url = song_data.get("url", url)
+            song_url = song_data.get("webpage_url") or song_data.get("original_url") or url
             success = await add_to_playlist(interaction.guild.id, name, song_url, title)
             if success:
                 await interaction.followup.send(f"Added **{title}** to playlist **{name}**.")
@@ -3132,8 +3220,10 @@ class MusicCog(commands.Cog):
                 info = await song_loader.extract_info_async(url)
                 if info and "entries" in info:
                     for t in info["entries"]:
-                        if t and t.get("url"):
-                            tracks.append({"url": t["url"], "title": t.get("title", "Unknown")})
+                        if t:
+                            track_url = t.get("webpage_url") or t.get("original_url") or t.get("url", "")
+                            if track_url and "googlevideo.com" not in track_url:
+                                tracks.append({"url": track_url, "title": t.get("title", "Unknown")})
             
             # Step 2: Save to database
             if not tracks:
@@ -3179,29 +3269,17 @@ class MusicCog(commands.Cog):
     @playlist_group.command(name="play", description="Play a saved playlist")
     async def playlist_play(self, interaction: discord.Interaction, name: str):
         await interaction.response.defer()
-        
+
         if interaction.guild.id not in guild_queues:
             guild_queues[interaction.guild.id] = OptimizedQueue()
-
         queue = guild_queues[interaction.guild.id]
-        
+
         voice_client = await self._ensure_voice(interaction, queue)
         if not voice_client:
-            if interaction.user.voice:
-                await interaction.user.voice.channel.connect()
-                voice_client = interaction.guild.voice_client
-            else:
-                await interaction.followup.send("You are not in a voice channel.", ephemeral=True)
-                return
-        elif not interaction.user.voice or interaction.user.voice.channel != voice_client.channel:
-            await interaction.followup.send("You must be in the same voice channel as the bot.", ephemeral=True)
+            await interaction.followup.send("You are not in a voice channel.", ephemeral=True)
             return
 
         tracks = await get_playlist(interaction.guild.id, name)
-        logger.info(f"Playlist '{name}' loaded: {len(tracks) if tracks else 0} tracks")
-        if tracks:
-            logger.info(f"First track raw data: {tracks[0]}")
-        
         if tracks is None:
             await interaction.followup.send(f"Playlist **{name}** not found.", ephemeral=True)
             return
@@ -3209,62 +3287,55 @@ class MusicCog(commands.Cog):
             await interaction.followup.send(f"Playlist **{name}** is empty.", ephemeral=True)
             return
 
-        # Show loading message with progress
         loading_msg = await interaction.followup.send(
             embed=self.make_embed(
                 title="📂 Loading Playlist",
-                description=f"Loading **{name}**...\nPreparing {len(tracks)} tracks...",
+                description=f"Loading **{name}** ({len(tracks)} tracks)...",
                 color=0x3498db
             )
         )
 
         added = 0
         failed = 0
-        total = len(tracks)
-        
-        for i, track in enumerate(tracks):
+        playback_started = False
+
+        BATCH_SIZE = 5
+        for batch_start in range(0, len(tracks), BATCH_SIZE):
+            batch = tracks[batch_start:batch_start + BATCH_SIZE]
+            urls = [t.get("url", "") for t in batch if t.get("url")]
+
+            results = await asyncio.gather(
+                *[self._quick_add_song(u, requester=interaction.user) for u in urls],
+                return_exceptions=True
+            )
+
+            for result in results:
+                if isinstance(result, Exception) or not result:
+                    failed += 1
+                    continue
+                queue.add(result)
+                added += 1
+
+                if not playback_started and not voice_client.is_playing() and not voice_client.is_paused():
+                    playback_started = True
+                    asyncio.create_task(self.play_next(interaction.guild, voice_client, interaction))
+
             try:
-                track_url = track.get("url", "")
-                if not track_url:
-                    logger.warning(f"Track {i} in playlist {name} has no URL")
-                    failed += 1
-                    continue
-                    
-                if needs_resolution(track_url):
-                    logger.info(f"Resolving URL for track {i}: {track_url}")
-                    direct = await resolve_to_direct_url(track_url)
-                    if direct:
-                        track_url = direct
-                        logger.info(f"Resolved to: {track_url}")
-                    else:
-                        logger.warning(f"Failed to resolve track {i}: {track_url}")
-                        failed += 1
-                        continue
-                        
-                info = await song_loader.extract_info_async(track_url)
-                if not info:
-                    logger.warning(f"Failed to extract info for track {i}: {track_url}")
-                    failed += 1
-                    continue
-                    
-                song_data = info["entries"][0] if "entries" in info and info["entries"] else info
-                if not song_data:
-                    logger.warning(f"No song data for track {i}: {track_url}")
-                    failed += 1
-                    continue
-                    
-                processed = await self.process_single_entry(song_data, requester=interaction.user)
-                if processed:
-                    queue.add(processed)
-                    added += 1
-            except Exception as e:
-                logger.error(f"Error processing track {i}: {e}")
-                failed += 1
-                
-        await interaction.followup.send(f"Added {added} songs from playlist **{name}** to the end of the queue.")
-        
-        if not voice_client.is_playing() and not voice_client.is_paused():
-            await self.play_next(interaction.guild, voice_client, interaction)
+                await loading_msg.edit(embed=self.make_embed(
+                    title="📂 Loading Playlist",
+                    description=f"Loading **{name}**... {added + failed}/{len(tracks)}",
+                    color=0x3498db,
+                    fields=[("Added", f"```\n{added}\n```", True), ("Failed", f"```\n{failed}\n```", True)]
+                ))
+            except Exception:
+                pass
+
+        await loading_msg.edit(embed=self.make_embed(
+            title="✅ Playlist Loaded",
+            description=f"Added **{added}** songs from **{name}** to the queue.",
+            color=0x2ecc71,
+            fields=[("Added", f"```\n{added}\n```", True), ("Failed", f"```\n{failed}\n```", True)]
+        ))
 
     @dynamic_playlist_group.command(name="create", description="Create a dynamic playlist from a source URL")
     async def dynamic_playlist_create(self, interaction: discord.Interaction, name: str, url: str):
@@ -3297,16 +3368,13 @@ class MusicCog(commands.Cog):
     async def dynamic_playlist_play(self, interaction: discord.Interaction, name: str):
         await interaction.response.defer()
 
-        voice_client = interaction.guild.voice_client
+        if interaction.guild.id not in guild_queues:
+            guild_queues[interaction.guild.id] = OptimizedQueue()
+        queue = guild_queues[interaction.guild.id]
+
+        voice_client = await self._ensure_voice(interaction, queue)
         if not voice_client:
-            if interaction.user.voice:
-                await interaction.user.voice.channel.connect()
-                voice_client = interaction.guild.voice_client
-            else:
-                await interaction.followup.send("You are not in a voice channel.", ephemeral=True)
-                return
-        elif not interaction.user.voice or interaction.user.voice.channel != voice_client.channel:
-            await interaction.followup.send("You must be in the same voice channel as the bot.", ephemeral=True)
+            await interaction.followup.send("You are not in a voice channel.", ephemeral=True)
             return
 
         info = await get_dynamic_playlist(interaction.user.id, name)
@@ -3314,35 +3382,64 @@ class MusicCog(commands.Cog):
             await interaction.followup.send(f"Dynamic playlist **{name}** not found.", ephemeral=True)
             return
 
-        await interaction.followup.send(f"Fetching tracks from **{info['source_type']}**...")
+        loading_msg = await interaction.followup.send(
+            embed=self.make_embed(
+                title="📂 Loading Dynamic Playlist",
+                description=f"Fetching tracks from **{info['source_type']}**...",
+                color=0x3498db
+            )
+        )
         tracks = await fetch_dynamic_tracks(info["source_url"], info["source_type"])
 
         if not tracks:
-            await interaction.followup.send("No tracks found in the source playlist.")
+            await loading_msg.edit(embed=self.make_embed(
+                title="❌ Empty Playlist",
+                description="No tracks found in the source playlist.",
+                color=0xe74c3c
+            ))
             return
 
-        if interaction.guild.id not in guild_queues:
-            guild_queues[interaction.guild.id] = OptimizedQueue()
-
-        queue = guild_queues[interaction.guild.id]
         added = 0
+        failed = 0
+        playback_started = False
 
-        for track in tracks:
+        BATCH_SIZE = 5
+        for batch_start in range(0, len(tracks), BATCH_SIZE):
+            batch = tracks[batch_start:batch_start + BATCH_SIZE]
+            urls = [t.get("url", "") for t in batch if t.get("url")]
+
+            results = await asyncio.gather(
+                *[self._quick_add_song(u, requester=interaction.user) for u in urls],
+                return_exceptions=True
+            )
+
+            for result in results:
+                if isinstance(result, Exception) or not result:
+                    failed += 1
+                    continue
+                queue.add(result)
+                added += 1
+
+                if not playback_started and not voice_client.is_playing() and not voice_client.is_paused():
+                    playback_started = True
+                    asyncio.create_task(self.play_next(interaction.guild, voice_client, interaction))
+
             try:
-                extracted = await song_loader.extract_info_async(track["url"])
-                song_data = extracted["entries"][0] if "entries" in extracted and extracted["entries"] else extracted
-                processed = await self.process_single_entry(song_data, requester=interaction.user)
-                if processed:
-                    queue.add(processed)
-                    added += 1
+                await loading_msg.edit(embed=self.make_embed(
+                    title="📂 Loading Dynamic Playlist",
+                    description=f"Loading **{name}**... {added + failed}/{len(tracks)}",
+                    color=0x3498db,
+                    fields=[("Added", f"```\n{added}\n```", True), ("Failed", f"```\n{failed}\n```", True)]
+                ))
             except Exception:
                 pass
 
-        if added > 0:
-            await interaction.followup.send(f"Added {added} songs from dynamic playlist **{name}** to the queue.")
-
-        if not voice_client.is_playing() and not voice_client.is_paused():
-            await self.play_next(interaction.guild, voice_client, interaction)
+        await loading_msg.edit(embed=self.make_embed(
+            title="✅ Dynamic Playlist Loaded",
+            description=f"Added **{added}** songs from **{name}** to the queue.",
+            color=0x2ecc71,
+            fields=[("Added", f"```\n{added}\n```", True), ("Failed", f"```\n{failed}\n```", True)]
+        ))
 
     @app_commands.command(name="purge", description="Purge bot messages from a channel")
     @app_commands.describe(channel="purge messages from a Channel (default: current channel)")
