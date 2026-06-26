@@ -3578,6 +3578,7 @@ class MusicCog(commands.Cog):
 
     @app_commands.command(name="purge", description="Purge bot messages from a channel")
     @app_commands.describe(channel="purge messages from a Channel (default: current channel)")
+    @app_commands.checks.has_permissions(manage_messages=True)
     async def purge_test(self, interaction: discord.Interaction, channel: Optional[discord.TextChannel] = None):
         await interaction.response.defer(ephemeral=True)
         
