@@ -98,36 +98,42 @@ async def resolve_direct(url: str) -> Optional[str]:
 
 async def get_tidal_playlist_tracks(url: str) -> Optional[List[str]]:
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, headers=headers) as response:
-            if response.status != 200:
-                return None
-            html = await response.text()
-            
-    soup = BeautifulSoup(html, 'html.parser')
-    track_urls = []
-    seen = set()
-    track_pattern = re.compile(r'(stage\.)?tidal\.com/(browse/)?track/\d+(/u)?', re.I)
-    for link in soup.find_all('a', href=True):
-        href = link['href']
-        match = track_pattern.search(href)
-        if match:
-            full_url = match.group(0)
-            if not full_url.startswith('http'):
-                full_url = 'https://' + full_url
-            if full_url not in seen:
-                seen.add(full_url)
-                track_urls.append(full_url)
-    for script in soup.find_all('script'):
-        if script.string:
-            for match in track_pattern.finditer(script.string):
-                full_url = match.group(0)
-                if not full_url.startswith('http'):
-                    full_url = 'https://' + full_url
-                if full_url not in seen:
-                    seen.add(full_url)
-                    track_urls.append(full_url)
-    return track_urls[:50] if track_urls else None
+
+    playlist_id_match = re.search(
+        r'tidal\.com/(?:browse/)?(?:playlist|album)/([a-f0-9\-]{36}|\d+)', url, re.I
+    )
+    if not playlist_id_match:
+        return None
+    playlist_id = playlist_id_match.group(1)
+
+    is_uuid = '-' in playlist_id
+    if is_uuid:
+        api_url = f"https://listen.tidal.com/v1/playlists/{playlist_id}/tracks"
+    else:
+        api_url = f"https://listen.tidal.com/v1/albums/{playlist_id}/tracks"
+
+    params = {"countryCode": "US", "limit": 50}
+    api_headers = {**headers, "X-Tidal-Token": "CzET4vdadNUFQ5JU"}
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(api_url, headers=api_headers, params=params) as response:
+                if response.status != 200:
+                    return None
+                data = await response.json()
+
+        items = data.get("items", [])
+        track_urls = []
+        for item in items:
+            track = item.get("item", item)
+            track_id = track.get("id")
+            if track_id:
+                track_urls.append(f"https://tidal.com/browse/track/{track_id}")
+        return track_urls if track_urls else None
+
+    except Exception as e:
+        print(f"Tidal API error: {e}")
+        return None
 
 async def resolve_playlist(url: str) -> Optional[List[dict]]:
     track_urls = await get_tidal_playlist_tracks(url)

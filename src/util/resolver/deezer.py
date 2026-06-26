@@ -97,41 +97,40 @@ async def resolve_direct(url: str) -> Optional[str]:
     return None
 
 async def get_deezer_playlist_tracks(url: str) -> Optional[List[str]]:
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept-Language": "de-DE,de;q=0.9",
-    }
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, headers=headers) as response:
-            if response.status != 200:
-                return None
-            html = await response.text()
-            
-    soup = BeautifulSoup(html, 'html.parser')
+    id_match = re.search(r'(?:link\.)?deezer\.com/(?:\w+/)?(playlist|album)/(\d+)', url, re.I)
+    if not id_match:
+        return None
+
+    content_type = id_match.group(1)
+    content_id = id_match.group(2)
+    api_url = f"https://api.deezer.com/{content_type}/{content_id}/tracks"
+
     track_urls = []
     seen = set()
-    track_pattern = re.compile(r'(link\.)?deezer\.com/(\w+/)?(track|s)/\w+', re.I)
-    for link in soup.find_all('a', href=True):
-        href = link['href']
-        match = track_pattern.search(href)
-        if match:
-            full_url = match.group(0)
-            if not full_url.startswith('http'):
-                full_url = 'https://' + full_url
-            if full_url not in seen:
-                seen.add(full_url)
-                track_urls.append(full_url)
-    # Look in script tags too
-    for script in soup.find_all('script'):
-        if script.string:
-            for match in track_pattern.finditer(script.string):
-                full_url = match.group(0)
-                if not full_url.startswith('http'):
-                    full_url = 'https://' + full_url
-                if full_url not in seen:
-                    seen.add(full_url)
-                    track_urls.append(full_url)
-    return track_urls[:50] if track_urls else None
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            next_url: Optional[str] = api_url
+            while next_url and len(track_urls) < 50:
+                async with session.get(next_url, headers=headers) as response:
+                    if response.status != 200:
+                        break
+                    data = await response.json()
+
+                for item in data.get("data", []):
+                    track_id = item.get("id")
+                    if track_id and track_id not in seen:
+                        seen.add(track_id)
+                        track_urls.append(f"https://deezer.com/track/{track_id}")
+
+                next_url = data.get("next")
+        return track_urls[:50] if track_urls else None
+    except Exception as e:
+        print(f"Deezer API error: {e}")
+        return None
 
 async def resolve_playlist(url: str) -> Optional[List[dict]]:
     track_urls = await get_deezer_playlist_tracks(url)

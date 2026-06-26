@@ -85,38 +85,47 @@ async def resolve_direct(url: str) -> Optional[str]:
     return None
 
 async def get_spotify_playlist_tracks(url: str) -> Optional[List[str]]:
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     async with aiohttp.ClientSession() as session:
         async with session.get(url, headers=headers) as response:
             if response.status != 200:
                 return None
             html = await response.text()
-            
+
     soup = BeautifulSoup(html, 'html.parser')
-    track_urls = []
+    next_data = soup.find("script", id="__NEXT_DATA__")
+    if not next_data or not next_data.string:
+        return None
+
+    import json
+    try:
+        data = json.loads(next_data.string)
+    except json.JSONDecodeError:
+        return None
+
+    def extract_tracks(obj) -> list:
+        tracks = []
+        if isinstance(obj, dict):
+            uri = obj.get("uri", "")
+            if uri.startswith("spotify:track:"):
+                track_id = uri.split(":")[-1]
+                if track_id:
+                    tracks.append(f"https://open.spotify.com/track/{track_id}")
+            for val in obj.values():
+                tracks.extend(extract_tracks(val))
+        elif isinstance(obj, list):
+            for item in obj:
+                tracks.extend(extract_tracks(item))
+        return tracks
+
+    all_tracks = extract_tracks(data)
     seen = set()
-    track_pattern = re.compile(r'open\.spotify\.com/([a-z]{2,4}-[a-z]{2}/)?track/\w+', re.I)
-    for link in soup.find_all('a', href=True):
-        href = link['href']
-        match = track_pattern.search(href)
-        if match:
-            full_url = match.group(0)
-            if not full_url.startswith('http'):
-                full_url = 'https://' + full_url
-            if full_url not in seen:
-                seen.add(full_url)
-                track_urls.append(full_url)
-    # Also look for track data in script tags
-    for script in soup.find_all('script'):
-        if script.string and 'Spotify.Entity' in script.string:
-            for match in track_pattern.finditer(script.string):
-                full_url = match.group(0)
-                if not full_url.startswith('http'):
-                    full_url = 'https://' + full_url
-                if full_url not in seen:
-                    seen.add(full_url)
-                    track_urls.append(full_url)
-    return track_urls[:50] if track_urls else None
+    unique = []
+    for t in all_tracks:
+        if t not in seen:
+            seen.add(t)
+            unique.append(t)
+    return unique[:50] if unique else None
 
 async def resolve_playlist(url: str) -> Optional[List[dict]]:
     track_urls = await get_spotify_playlist_tracks(url)

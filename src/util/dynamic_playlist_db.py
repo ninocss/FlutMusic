@@ -55,6 +55,22 @@ async def create_dynamic_playlist(user_id: str, name: str, source_url: str) -> t
     if not is_playlist(source_url) and source_type != "youtube":
         return False, "The URL does not appear to be a playlist/album URL."
 
+    try:
+        if source_type == "youtube":
+            opts = {**YT_OPTS, "extract_flat": True, "quiet": True}
+            def _check():
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    return ydl.extract_info(source_url, download=False)
+            info = await asyncio.to_thread(_check)
+            if not info or "entries" not in info:
+                return False, "Could not fetch playlist from YouTube. Is the URL correct and accessible?"
+        else:
+            resolved = await resolve_playlist(source_url)
+            if not resolved:
+                return False, "Could not resolve the playlist URL. Is it accessible?"
+    except Exception as e:
+        return False, f"Failed to validate URL: {str(e)[:200]}"
+
     data[user_id][name] = {
         "source_url": source_url,
         "source_type": source_type
@@ -88,7 +104,10 @@ async def get_user_dynamic_playlists(user_id: str) -> List[Dict]:
         for name, info in entries.items()
     ]
 
-async def fetch_dynamic_tracks(source_url: str, source_type: str) -> List[Dict]:
+async def fetch_dynamic_tracks(source_url: str, source_type: str = "") -> List[Dict]:
+    detected = detect_source_type(source_url)
+    source_type = detected or source_type
+
     if source_type == "youtube":
         opts = {**YT_OPTS, "extract_flat": True, "quiet": True}
         def run_yt():
@@ -98,17 +117,19 @@ async def fetch_dynamic_tracks(source_url: str, source_type: str) -> List[Dict]:
         tracks = []
         if "entries" in info:
             for entry in info["entries"]:
-                if entry and entry.get("url"):
-                    tracks.append({
-                        "url": entry["url"],
-                        "title": entry.get("title", "Unknown"),
-                    })
+                if entry:
+                    url = entry.get("url") or entry.get("webpage_url")
+                    if url:
+                        tracks.append({
+                            "url": url,
+                            "title": entry.get("title", "Unknown"),
+                        })
         return tracks
 
     resolved = await resolve_playlist(source_url)
     if resolved:
         return [
-            {"url": t["url"], "title": t.get("title", "Unknown")}
-            for t in resolved if t.get("url")
+            {"url": t.get("query", ""), "title": t.get("title", "Unknown")}
+            for t in resolved if t.get("query")
         ]
     return []

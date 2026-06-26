@@ -58,6 +58,7 @@ logger = logging.getLogger(__name__)
 
 guild_queues = {}
 guild_volumes = {}
+guild_autoplay: dict[int, bool] = {}
 
 AUTOPLAY_URL_RE = re.compile(r"(https?://[^\s)]+)", re.IGNORECASE)
 YT_PLAYLIST_RE = re.compile(r'(?:youtube|music\.youtube|youtu\.be).*(?:/playlist|list=)', re.I)
@@ -715,7 +716,7 @@ class MusicCog(commands.Cog):
                     logger.error(f"Error sending now playing message: {e}")
 
                 await self._set_song_activity(next_song_data['title'], next_song_data['author'])
-            elif AUTO_PLAY_ENABLED:
+            elif guild_autoplay.get(guild.id, False):
                 logger.info("autoplaying")
 
                 current = self.currently_playing.get(guild.id)
@@ -744,18 +745,20 @@ class MusicCog(commands.Cog):
                     video_id = video_id_match.group(1)
 
                     def _fetch_related():
-                        return self._ytmusic.get_song_related(video_id)
+                        watch = self._ytmusic.get_watch_playlist(videoId=video_id, limit=10, radio=True)
+                        tracks = watch.get("tracks", [])
+                        return [t for t in tracks if t.get("videoId") and t["videoId"] != video_id]
 
-                    related_songs = await asyncio.get_running_loop().run_in_executor(
+                    related_tracks = await asyncio.get_running_loop().run_in_executor(
                         song_loader.executor, _fetch_related
                     )
 
-                    if not related_songs:
+                    if not related_tracks:
                         logger.info("No related songs found")
                         queue.playing = False
                         return
 
-                    suggestion = related_songs[0]["videoid"]
+                    suggestion = related_tracks[0]["videoId"]
                     webpage_url = f"https://www.youtube.com/watch?v={suggestion}"
                 except Exception as e:
                     logger.error(f"Autoplay suggestion error: {e}")
@@ -3057,26 +3060,63 @@ class MusicCog(commands.Cog):
             )
         )
 
+    async def _playlist_name_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> "list[app_commands.Choice[str]]":
+        try:
+            playlists = await get_guild_playlists(interaction.guild.id)
+        except Exception:
+            return []
+        if not playlists:
+            return []
+        matches = [p for p in playlists if current.lower() in p.lower()] if current else playlists
+        return [app_commands.Choice(name=p, value=p) for p in matches[:25]]
 
     @playlist_group.command(name="create", description="Create a new playlist")
     async def playlist_create(self, interaction: discord.Interaction, name: str):
         await interaction.response.defer(ephemeral=True)
         success = await create_playlist(interaction.guild.id, name)
         if success:
-            await interaction.followup.send(f"Playlist **{name}** created for this server.")
+            await interaction.followup.send(
+                embed=self.make_embed(
+                    title="Playlist created",
+                    description=f"Playlist **{name}** was created for this server.\nAdd songs with `/playlist add`.",
+                    color=0x2ecc71,
+                )
+            )
         else:
-            await interaction.followup.send(f"Playlist **{name}** already exists.")
+            await interaction.followup.send(
+                embed=self.make_embed(
+                    title="⚠️ Already exists",
+                    description=f"Playlist **{name}** already exists.",
+                    color=0xe67e22,
+                )
+            )
 
     @playlist_group.command(name="delete", description="Delete a playlist")
+    @app_commands.autocomplete(name=_playlist_name_autocomplete)
     async def playlist_delete(self, interaction: discord.Interaction, name: str):
         await interaction.response.defer(ephemeral=True)
         success = await delete_playlist(interaction.guild.id, name)
         if success:
-            await interaction.followup.send(f"Playlist **{name}** deleted.")
+            await interaction.followup.send(
+                embed=self.make_embed(
+                    title="🗑️ Playlist deleted",
+                    description=f"Playlist **{name}** was deleted.",
+                    color=0xe74c3c,
+                )
+            )
         else:
-            await interaction.followup.send(f"Playlist **{name}** not found.")
+            await interaction.followup.send(
+                embed=self.make_embed(
+                    title="❌ Not found",
+                    description=f"Playlist **{name}** does not exist.",
+                    color=0xe74c3c,
+                )
+            )
 
-    @playlist_group.command(name="add", description="Add a song to the server playlist")
+    @playlist_group.command(name="add", description="Add a song to a playlist")
+    @app_commands.autocomplete(name=_playlist_name_autocomplete)
     async def playlist_add(self, interaction: discord.Interaction, name: str, url: str):
         await interaction.response.defer(ephemeral=True)
         try:
@@ -3086,58 +3126,134 @@ class MusicCog(commands.Cog):
                     url = direct
             info = await song_loader.extract_info_async(url)
             if not info:
-                await interaction.followup.send(f"Could not extract info from URL: **{url}**")
+                await interaction.followup.send(
+                    embed=self.make_embed(title="❌ Error", description=f"Could not load info from URL: **{url}**", color=0xe74c3c)
+                )
                 return
             song_data = info["entries"][0] if "entries" in info and info["entries"] else info
             if not song_data:
-                await interaction.followup.send(f"Could not extract song data from URL: **{url}**")
+                await interaction.followup.send(
+                    embed=self.make_embed(title="❌ Error", description="No song data found.", color=0xe74c3c)
+                )
                 return
             title = song_data.get("title", "Unknown")
             song_url = song_data.get("webpage_url") or song_data.get("original_url") or url
             success = await add_to_playlist(interaction.guild.id, name, song_url, title)
             if success:
-                await interaction.followup.send(f"Added **{title}** to playlist **{name}**.")
-            else:
-                await interaction.followup.send(f"Playlist **{name}** not found. Use `/playlist create` first.")
-        except Exception as e:
-            await interaction.followup.send(f"Failed to extract info from URL: {e}")
-
-    @playlist_group.command(name="import", description="Import a YouTube/Spotify playlist")
-    async def playlist_import(self, interaction: discord.Interaction, name: str, url: str):
-        await interaction.response.defer(ephemeral=True)
-        if await get_playlist(interaction.guild.id, name) is None:
-            await interaction.followup.send(f"Playlist **{name}** not found. Create it first.")
-            return
-            
-        try:
-            tracks = []
-            
-            # Step 1: Resolving tracks
-            if is_playlist(url):
-                resolved = await resolve_playlist(url)
-                if not resolved:
-                    await interaction.followup.send("Could not resolve playlist. Make sure the URL is valid.")
-                    return
-                    
-                loading_msg = await interaction.followup.send(
+                source = detect_source(song_url)
+                icon = source.get("icon", "🎵") if source else "🎵"
+                await interaction.followup.send(
                     embed=self.make_embed(
-                        title="🔍 Resolving Tracks",
-                        description=f"Found **{len(resolved)}** tracks\nConverting to playable URLs...",
-                        color=0x3498db
+                        title=f"{icon} Song added",
+                        description=f"**{title}** was added to **{name}**.",
+                        color=0x2ecc71,
                     )
                 )
-                
+            else:
+                await interaction.followup.send(
+                    embed=self.make_embed(
+                        title="❌ Playlist not found",
+                        description=f"Playlist **{name}** does not exist. Create it first with `/playlist create`.",
+                        color=0xe74c3c,
+                    )
+                )
+        except Exception as e:
+            await interaction.followup.send(
+                embed=self.make_embed(title="❌ Error", description=f"```\n{e}\n```", color=0xe74c3c)
+            )
+
+    _IMPORT_PLAYLIST_PATTERNS = re.compile(
+        r"(youtube\.com/playlist|youtu\.be/.*list=|music\.youtube\.com/playlist"
+        r"|open\.spotify\.com/(playlist|album|artist)"
+        r"|deezer\.com/(playlist|album|artist)"
+        r"|tidal\.com/(playlist|album|artist)"
+        r"|soundcloud\.com/[^/]+/sets/"
+        r"|music\.apple\.com/.+/(playlist|album)"
+        r"|bandcamp\.com/album/)",
+        re.IGNORECASE,
+    )
+
+    @playlist_group.command(name="import", description="Imports a playlist")
+    @app_commands.autocomplete(name=_playlist_name_autocomplete)
+    async def playlist_import(self, interaction: discord.Interaction, name: str, url: str):
+        await interaction.response.defer(ephemeral=True)
+
+        if await get_playlist(interaction.guild.id, name) is None:
+            await interaction.followup.send(
+                embed=self.make_embed(
+                    title="❌ Playlist not found",
+                    description=f"Playlist **{name}** does not exist. Create it first with `/playlist create`.",
+                    color=0xe74c3c,
+                )
+            )
+            return
+
+        # Plattform-Erkennung für schönes Feedback
+        source_info = detect_source(url)
+        source_label = source_info.get("label", "Unknown") if source_info else "Unknown"
+        source_icon  = source_info.get("icon", "🔗")         if source_info else "🔗"
+
+        try:
+            tracks = []
+            is_multi = is_playlist(url) or bool(self._IMPORT_PLAYLIST_PATTERNS.search(url))
+
+            loading_msg = await interaction.followup.send(
+                embed=self.make_embed(
+                    title=f"{source_icon} Importing from {source_label}",
+                    description=f"Loading tracks from **{url}** ...",
+                    color=0x3498db,
+                )
+            )
+
+            # ── Playlist / Album / Multi-Track ──────────────────────────────
+            if is_multi:
+                resolved = await resolve_playlist(url)
+
+                if not resolved:
+                    # Fallback: direkt per yt-dlp flach extrahieren
+                    try:
+                        info = await song_loader.extract_info_async(url)
+                        if info and "entries" in info:
+                            resolved = [
+                                {
+                                    "title": t.get("title", "Unknown"),
+                                    "url":   t.get("webpage_url") or t.get("original_url") or t.get("url", ""),
+                                    "id":    t.get("id", ""),
+                                }
+                                for t in info["entries"] if t
+                            ]
+                    except Exception:
+                        pass
+
+                if not resolved:
+                    await loading_msg.edit(
+                        embed=self.make_embed(
+                            title="❌ Import failed",
+                            description="Playlist could not be resolved. Make sure the URL is public and valid.",
+                            color=0xe74c3c,
+                        )
+                    )
+                    return
+
+                await loading_msg.edit(
+                    embed=self.make_embed(
+                        title=f"{source_icon} Resolving tracks ...",
+                        description=f"Found: **{len(resolved)} Tracks** from {source_label}\nConverting to playable URLs ...",
+                        color=0x3498db,
+                    )
+                )
+
                 failed_count = 0
                 total = len(resolved)
                 BATCH_SIZE = 5
 
                 for batch_start in range(0, total, BATCH_SIZE):
-                    batch = resolved[batch_start:batch_start + BATCH_SIZE]
+                    batch = resolved[batch_start : batch_start + BATCH_SIZE]
 
                     async def _resolve_one(t):
-                        query = t.get("query", "")
+                        query     = t.get("query", "")
                         video_url = t.get("url", "")
-                        video_id = t.get("id", "")
+                        video_id  = t.get("id", "")
                         video_title = t.get("title", "Unknown")
                         final_url = ""
 
@@ -3145,25 +3261,23 @@ class MusicCog(commands.Cog):
                             try:
                                 search_info = await song_loader.extract_info_async(query)
                                 if search_info and "entries" in search_info and search_info["entries"]:
-                                    first_result = search_info["entries"][0]
-                                    final_url = first_result.get("webpage_url") or first_result.get("original_url") or first_result.get("url", "")
+                                    first = search_info["entries"][0]
+                                    final_url = first.get("webpage_url") or first.get("original_url") or first.get("url", "")
                             except Exception:
                                 return None
                         elif video_id:
                             final_url = f"https://www.youtube.com/watch?v={video_id}"
                         elif video_url and ("youtube.com/watch" in video_url or "youtu.be" in video_url):
                             final_url = video_url
-                        elif video_url and "googlevideo.com" in video_url:
-                            id_match = re.search(r'[?&]id=([\w-]{11})', video_url)
-                            if id_match:
-                                final_url = f"https://www.youtube.com/watch?v={id_match.group(1)}"
+                        elif video_url and "googlevideo.com" not in video_url and video_url.startswith("http"):
+                            # SoundCloud, Bandcamp, etc. direkt übernehmen
+                            final_url = video_url
 
                         if final_url:
                             return {"url": final_url, "title": video_title}
                         return None
 
                     results = await asyncio.gather(*[_resolve_one(t) for t in batch], return_exceptions=True)
-
                     for r in results:
                         if isinstance(r, dict):
                             tracks.append(r)
@@ -3174,77 +3288,94 @@ class MusicCog(commands.Cog):
                     try:
                         await loading_msg.edit(
                             embed=self.make_embed(
-                                title="🔍 Resolving Tracks",
-                                description=f"Resolving **{name}**...\nProcessed {processed}/{total} tracks",
+                                title=f"{source_icon} Resolving tracks ...",
+                                description=f"Importing **{name}** from {source_label}",
                                 color=0x3498db,
                                 fields=[
-                                    ("Resolved", f"```\n{len(tracks)}\n```", True),
+                                    ("Processed", f"```\n{processed}/{total}\n```", True),
+                                    ("Successful", f"```\n{len(tracks)}\n```", True),
                                     ("Failed", f"```\n{failed_count}\n```", True),
-                                ]
+                                ],
                             )
                         )
                     except Exception:
                         pass
+
+            # ── Einzelner Track ─────────────────────────────────────────────
             else:
-                # Single URL or non-playlist
-                loading_msg = await interaction.followup.send(
-                    embed=self.make_embed(
-                        title="📥 Importing",
-                        description="Fetching tracks...",
-                        color=0x3498db
-                    )
-                )
-                
                 info = await song_loader.extract_info_async(url)
                 if info and "entries" in info:
                     for t in info["entries"]:
-                        if t:
-                            track_url = t.get("webpage_url") or t.get("original_url") or t.get("url", "")
-                            if track_url and "googlevideo.com" not in track_url:
-                                tracks.append({"url": track_url, "title": t.get("title", "Unknown")})
-            
-            # Step 2: Save to database
+                        if not t:
+                            continue
+                        track_url = t.get("webpage_url") or t.get("original_url") or t.get("url", "")
+                        if track_url and "googlevideo.com" not in track_url:
+                            tracks.append({"url": track_url, "title": t.get("title", "Unknown")})
+                elif info:
+                    track_url = info.get("webpage_url") or info.get("original_url") or info.get("url", "")
+                    if track_url:
+                        tracks.append({"url": track_url, "title": info.get("title", "Unknown")})
+
+            # ── Speichern ───────────────────────────────────────────────────
             if not tracks:
                 await loading_msg.edit(
                     embed=self.make_embed(
-                        title="❌ Import Failed",
-                        description="No tracks found to import.",
-                        color=0xe74c3c
+                        title="❌ No tracks found",
+                        description="No playable tracks could be imported.\nCheck if the URL/Playlist is public.",
+                        color=0xe74c3c,
                     )
                 )
                 return
-            
+
             await import_playlist_tracks(interaction.guild.id, name, tracks)
-            
-            # Step 3: Final summary
-            success_count = len(tracks)
+
             await loading_msg.edit(
                 embed=self.make_embed(
-                    title="✅ Import Complete",
-                    description=f"Successfully imported **{success_count}** track{'s' if success_count != 1 else ''} to **{name}**.",
+                    title="✅ Import completed",
+                    description=f"**{len(tracks)} Track{'s' if len(tracks) != 1 else ''}** successfully imported.",
                     color=0x2ecc71,
                     fields=[
                         ("Playlist", f"```\n{name}\n```", True),
-                        ("Tracks", f"```\n{success_count}\n```", True),
-                    ]
+                        ("Source", f"```\n{source_label}\n```", True),
+                        ("Tracks", f"```\n{len(tracks)}\n```", True),
+                    ],
                 )
             )
-            
+
         except Exception as e:
             logger.error(f"Playlist import failed: {e}")
-            await interaction.followup.send(f"Failed to import playlist: {e}")
-
-    @playlist_group.command(name="list", description="List server playlists")
+            await interaction.followup.send(
+                embed=self.make_embed(
+                    title="❌ Import failed",
+                    description=f"```\n{e}\n```",
+                    color=0xe74c3c,
+                )
+            )
+    @playlist_group.command(name="list", description="Zeige alle Server-Playlists")
     async def playlist_list(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         playlists = await get_guild_playlists(interaction.guild.id)
         if not playlists:
-            await interaction.followup.send("This server doesn't have any playlists.")
+            await interaction.followup.send(
+                embed=self.make_embed(
+                    title="📂 No Playlists",
+                    description="This server has no playlists yet.\nCreate one with `/playlist create`.",
+                    color=0x95a5a6,
+                )
+            )
         else:
-            msg = "**Server Playlists:**\n" + "\n".join(f"- {p}" for p in playlists)
-            await interaction.followup.send(msg)
+            lines = [f"`{i+1}.` **{p}**" for i, p in enumerate(playlists)]
+            await interaction.followup.send(
+                embed=self.make_embed(
+                    title=f"📂 Server-Playlists ({len(playlists)})",
+                    description="\n".join(lines),
+                    color=0x3498db,
+                    fields=[("Tip", "Use `/playlist play <name>` to play", False)],
+                )
+            )
 
-    @playlist_group.command(name="play", description="Play a saved playlist")
+    @playlist_group.command(name="play", description="Play a playlist")
+    @app_commands.autocomplete(name=_playlist_name_autocomplete)
     async def playlist_play(self, interaction: discord.Interaction, name: str):
         if await self.check_timeout_decorator(interaction):
             return
@@ -3261,17 +3392,31 @@ class MusicCog(commands.Cog):
 
         tracks = await get_playlist(interaction.guild.id, name)
         if tracks is None:
-            await interaction.followup.send(f"Playlist **{name}** not found.", ephemeral=True)
+            await interaction.followup.send(
+                embed=self.make_embed(
+                    title="❌ Not found",
+                    description=f"Playlist **{name}** does not exist.",
+                    color=0xe74c3c,
+                ),
+                ephemeral=True,
+            )
             return
         if not tracks:
-            await interaction.followup.send(f"Playlist **{name}** is empty.", ephemeral=True)
+            await interaction.followup.send(
+                embed=self.make_embed(
+                    title="📭 Playlist empty",
+                    description=f"Playlist **{name}** contains no songs.",
+                    color=0xe67e22,
+                ),
+                ephemeral=True,
+            )
             return
 
         loading_msg = await interaction.followup.send(
             embed=self.make_embed(
                 title="📂 Loading Playlist",
-                description=f"Loading **{name}** ({len(tracks)} tracks)...",
-                color=0x3498db
+                description=f"Loading **{name}** ({len(tracks)} tracks) ...",
+                color=0x3498db,
             )
         )
 
@@ -3281,12 +3426,12 @@ class MusicCog(commands.Cog):
 
         BATCH_SIZE = 5
         for batch_start in range(0, len(tracks), BATCH_SIZE):
-            batch = tracks[batch_start:batch_start + BATCH_SIZE]
+            batch = tracks[batch_start : batch_start + BATCH_SIZE]
             urls = [t.get("url", "") for t in batch if t.get("url")]
 
             results = await asyncio.gather(
                 *[self._quick_add_song(u, requester=interaction.user) for u in urls],
-                return_exceptions=True
+                return_exceptions=True,
             )
 
             for result in results:
@@ -3301,21 +3446,31 @@ class MusicCog(commands.Cog):
                     asyncio.create_task(self.play_next(interaction.guild, voice_client, interaction))
 
             try:
-                await loading_msg.edit(embed=self.make_embed(
-                    title="📂 Loading Playlist",
-                    description=f"Loading **{name}**... {added + failed}/{len(tracks)}",
-                    color=0x3498db,
-                    fields=[("Added", f"```\n{added}\n```", True), ("Failed", f"```\n{failed}\n```", True)]
-                ))
+                await loading_msg.edit(
+                    embed=self.make_embed(
+                        title="📂 Loading Playlist ...",
+                        description=f"**{name}** — {added + failed}/{len(tracks)}",
+                        color=0x3498db,
+                        fields=[
+                            ("Added", f"```\n{added}\n```", True),
+                            ("Failed", f"```\n{failed}\n```", True),
+                        ],
+                    )
+                )
             except Exception:
                 pass
 
-        await loading_msg.edit(embed=self.make_embed(
-            title="✅ Playlist Loaded",
-            description=f"Added **{added}** songs from **{name}** to the queue.",
-            color=0x2ecc71,
-            fields=[("Added", f"```\n{added}\n```", True), ("Failed", f"```\n{failed}\n```", True)]
-        ))
+        await loading_msg.edit(
+            embed=self.make_embed(
+                title="✅ Playlist loaded",
+                description=f"**{added}** songs from **{name}** added to the queue.",
+                color=0x2ecc71,
+                fields=[
+                    ("Added", f"```\n{added}\n```", True),
+                    ("Failed", f"```\n{failed}\n```", True),
+                ],
+            )
+        )
 
     @dynamic_playlist_group.command(name="create", description="Create a dynamic playlist from a source URL")
     async def dynamic_playlist_create(self, interaction: discord.Interaction, name: str, url: str):
@@ -3383,7 +3538,6 @@ class MusicCog(commands.Cog):
 
         added = 0
         failed = 0
-        playback_started = False
 
         BATCH_SIZE = 5
         for batch_start in range(0, len(tracks), BATCH_SIZE):
@@ -3402,10 +3556,6 @@ class MusicCog(commands.Cog):
                 queue.add(result)
                 added += 1
 
-                if not playback_started and not voice_client.is_playing() and not voice_client.is_paused():
-                    playback_started = True
-                    asyncio.create_task(self.play_next(interaction.guild, voice_client, interaction))
-
             try:
                 await loading_msg.edit(embed=self.make_embed(
                     title="📂 Loading Dynamic Playlist",
@@ -3415,6 +3565,9 @@ class MusicCog(commands.Cog):
                 ))
             except Exception:
                 pass
+
+        if not voice_client.is_playing() and not voice_client.is_paused() and added > 0:
+            await self.play_next(interaction.guild, voice_client, interaction)
 
         await loading_msg.edit(embed=self.make_embed(
             title="✅ Dynamic Playlist Loaded",
@@ -3469,6 +3622,20 @@ class MusicCog(commands.Cog):
 
         await interaction.followup.send(embed=embed)
 
+    @app_commands.command(name="autoplay", description="Toggle autoplay (auto-queues related songs when queue is empty)")
+    async def autoplay(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        current = guild_autoplay.get(interaction.guild.id, False)
+        guild_autoplay[interaction.guild.id] = not current
+        state = "enabled" if not current else "disabled"
+        await interaction.followup.send(
+            embed=self.make_embed(
+                title=f"🔁 Autoplay {state}",
+                description=f"Autoplay is now **{state}**.",
+                color=0x2ecc71 if not current else 0xe74c3c
+            )
+        )
+
     async def cog_load(self):
         self.bot.tree.add_command(self.playlist_group, guild=discord.Object(id=SYNC_SERVER))
         self.bot.tree.add_command(self.dynamic_playlist_group, guild=discord.Object(id=SYNC_SERVER))
@@ -3491,6 +3658,7 @@ class MusicCog(commands.Cog):
         self.bot.tree.add_command(self.botstats, guild=discord.Object(id=SYNC_SERVER))
         self.bot.tree.add_command(self.musicmute_list, guild=discord.Object(id=SYNC_SERVER))
         self.bot.tree.add_command(self.purge_test, guild=discord.Object(id=SYNC_SERVER))
+        self.bot.tree.add_command(self.autoplay, guild=discord.Object(id=SYNC_SERVER))
 
     async def cog_unload(self):
         for task in self.background_tasks:
